@@ -1,0 +1,5 @@
+/routini-runner
+/build/
+/dist/
+*.test
+*.out
