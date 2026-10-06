@@ -45,16 +45,19 @@ The runner writes its config file at mode 0600, creating the parent directory at
 { "url": "https://routini.example.com", "runnerId": "uuid", "credential": "rrc_xxx", "caFile": null,
   "capabilities": { "exec": true, "pty": true, "agents": false },
   "maxConcurrentExec": 8, "maxConcurrentAgents": 2,
-  "agentImagePrefixes": ["ghcr.io/nvasion/"], "dockerHost": "" }
+  "agentImagePrefixes": ["ghcr.io/nvasion/"], "dockerHost": "", "containerRuntime": "" }
 ```
 
 Admins can edit `capabilities` and the limits by hand. For example, `"pty": false` turns off interactive terminals on that server.
 
-`capabilities.agents` is **false** by default: running agent steps on this host (section 2.6) is opt-in, because it needs access to the local Docker daemon. The other agent settings only matter once it is true:
+`capabilities.agents` enables containerised agent tasks (section 2.6). Enrollment writes it as **false**, because it needs access to the local Docker daemon. Setting it to `true` is not enough on its own: the runner advertises `agents` only when **both** `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup. If the ping fails, the runner starts normally, does not advertise `agents`, and refuses `agent.start`.
 
-- `maxConcurrentAgents` caps parallel agent containers. Missing or not positive means the default, 2.
-- `agentImagePrefixes` is the image allow-list. Missing or empty means `["ghcr.io/nvasion/"]`. The runner refuses `agent.start` for any agent or egress image that does not start with one of these prefixes.
-- `dockerHost` is the Docker endpoint. `""` means `unix:///var/run/docker.sock`.
+Optional keys that only matter once `capabilities.agents` is true:
+
+- `agentImagePrefixes`: the image allow-list, the image references the runner is willing to run. Missing or empty means `["ghcr.io/nvasion/"]`. The runner refuses `agent.start` for any agent or egress image that does not start with one of these prefixes.
+- `maxConcurrentAgents`: caps parallel agent containers. Missing or not positive means the default, 2.
+- `dockerHost`: the Docker endpoint. Default `""`, meaning `unix:///var/run/docker.sock`. The `DOCKER_HOST` environment variable overrides it.
+- `containerRuntime`: default `""`, meaning Docker's default runtime. `"runsc"` selects gVisor.
 
 ## 2. Control connection (WebSocket)
 
@@ -87,7 +90,7 @@ The runner sends `hello` immediately after the connection opens:
   "capabilities": ["exec", "pty", "agents"], "facts": { ...see 2.2 } }
 ```
 
-`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `agents` appears only when **both** `capabilities.agents` is true in the config **and** the local Docker daemon answers; a runner that cannot reach Docker does not advertise it, even with the flag on. A server must not send the frames of a feature it was not offered.
+`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. A server must not send the frames of a feature it was not offered.
 
 The server replies with `welcome`:
 
@@ -111,14 +114,14 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
   "memTotalMb": 7972, "memUsedPct": 41,
   "diskTotalGb": 78.6, "diskUsedPct": 63,
   "addresses": ["10.0.0.11", "fd00::11"],
-  "docker": { "ok": true, "version": "27.1.1", "agentsRunning": 0, "maxAgents": 2 }
+  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2 }
 }
 ```
 
 - `memUsedPct` is `(MemTotal - MemAvailable) / MemTotal`.
 - `diskUsedPct` covers `/` and excludes reserved blocks: `(total - free) / (total - free + avail)`, which is the same as `df`.
 - `addresses` lists non-loopback interface addresses.
-- `docker` is present only when `capabilities.agents` is true in the config. `ok` says whether the daemon answered at the last probe; `version` is its server version, omitted when it did not answer. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. A runner with the flag off omits the whole block, and so does an older runner, which is why the protocol version stays 1.
+- `docker` reports the local Docker daemon: `available` says whether it answered at the last probe and `version` is what its ping returned. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. The whole object is omitted when Docker is unreachable; an older runner omits it too, which is why the protocol version stays 1.
 
 ### 2.3 Exec: run a command
 
@@ -212,56 +215,38 @@ The server may also close the connection with WebSocket close code `4000` (anoth
 
 ### 2.6 Agents
 
-An agent step can run on a fleet host instead of the Routini sandbox. The step then runs in a container on **this** host's Docker, with the same credential guarantee as the sandbox: the agent container holds **placeholders**, never real keys, and its only route out is a local egress proxy that enforces the org's allow-list and injects the real credentials.
+An agent task runs a container image instead of a shell command, on an internal Docker network with no route to the internet. It runs on **this** host's Docker, with the same credential guarantee as the Routini sandbox: the agent container holds **placeholders**, never real keys, and its only way out is `routini-egress`, a local proxy that terminates TLS for the hosts the server allowed, enforces the org's allow-list and injects the real credentials.
 
 These frames exist only for a runner that advertised the `agents` capability in `hello` (section 2.1). They are additive and gated by that capability, so the protocol version stays **1**.
 
 The server starts an agent:
 
 ```json
-{ "type": "agent.start", "id": "task-uuid",
-  "image": "ghcr.io/nvasion/routini-agent-claude:0.2.0",
-  "prompt": "Check why nginx is restarting and summarise the cause.",
-  "env": { "ANTHROPIC_API_KEY": "routini-placeholder-1", "ROUTINI_STEP": "triage" },
+{ "type": "agent.start", "id": "task-uuid", "image": "ghcr.io/nvasion/routini-agent-claude:0.3.0", "pull": "missing",
+  "user": "1000:1000", "cpus": 2, "memoryMb": 4096, "pidsLimit": 512, "timeoutSec": 1800,
+  "env": { "ROUTINI_PROMPT": "...", "ANTHROPIC_API_KEY": "routini-brokered-credential" },
+  "labels": { "routini.managed": "true", "routini.org": "...", "routini.run": "...", "routini.step": "0" },
   "egress": {
-    "image": "ghcr.io/nvasion/routini-egress:0.2.0",
-    "allow": ["api.anthropic.com"],
-    "secrets": { "routini-placeholder-1": "<the real credential>" }
-  },
-  "timeoutSec": 1800, "cpus": 2, "memoryMb": 4096 }
+    "image": "ghcr.io/nvasion/routini-egress:0.3.0",
+    "network": "routini-sb-<org id>",
+    "session": {
+      "token": "...",
+      "orgId": "...",
+      "label": "run 12 step 1",
+      "allowedHosts": ["..."],
+      "bindings": [ { "host": "api.anthropic.com", "header": "x-api-key", "format": "raw", "secret": "..." } ],
+      "expiresAt": "..."
+    }
+  } }
 ```
 
-- `image` and `egress.image` must match a prefix in `agentImagePrefixes`, otherwise the runner refuses the task.
+- `pull` is `"missing"` (pull only when the image is absent) or `"always"`.
+- `user` defaults to `1000:1000` and `pidsLimit` to 512. `cpus` becomes a CPU quota, `memoryMb` a memory limit in MiB. `timeoutSec` has no hosted clamp: fleet agent time is the customer's own compute.
+- `image` and `egress.image` must both match a prefix in `agentImagePrefixes`, otherwise the runner refuses the task.
 - `env` keys must match `^[A-Za-z_][A-Za-z0-9_]*$`, as for exec. The values the agent sees are placeholders.
-- `egress.allow` is the list of hostnames the proxy will connect to. `egress.secrets` maps each placeholder to the real credential it stands for. Both reach the runner over the existing TLS WebSocket and are never written to disk, never logged, and never passed to the agent container.
-- `timeoutSec` has no hosted clamp: fleet agent time is the customer's own compute. `cpus` and `memoryMb` are optional container limits.
-
-On `agent.start` the runner does seven things:
-
-1. **Validate.** The `agents` capability is on, both images match `agentImagePrefixes`, every `env` key is well-formed, every `egress.secrets` placeholder is referenced by `env`, and fewer than `maxConcurrentAgents` agents are running. A failure ends the task at once with an `agent.exit` carrying `error`, and nothing is started.
-2. **Create an internal network.** One Docker network per task, named `routini-agent-<id>`, created **internal** so no container on it can reach the host network, the internet or the Docker socket directly.
-3. **Start the egress proxy.** The `egress.image` container joins that network under the name `egress`, with the allow-list and the real secrets in its environment only. The secrets live in the proxy's memory for the session and nowhere else.
-4. **Start the agent.** The `image` container joins the same network, with the placeholder `env`, `HTTPS_PROXY` and `HTTP_PROXY` pointing at the proxy, the proxy's CA trusted, the requested `cpus` and `memoryMb` limits, no privileged mode, no host mounts and no Docker socket.
-5. **Stream output.** The runner follows both container streams and sends one frame per line, with the same line rules as exec (section 2.3).
-6. **Wait.** When the agent container exits, is canceled or hits `timeoutSec`, the runner sends exactly one `agent.exit`.
-7. **Clean up.** The runner stops and removes both containers and removes the network, always, including on every error path, and drops the secrets from memory.
-
-Output frames carry the same shape as exec output, with `stream` naming the source:
-
-```json
-{ "type": "agent.output", "id": "task-uuid", "stream": "stdout", "data": "Reading /var/log/nginx/error.log" }
-```
-
-`stream` is `"stdout"` or `"stderr"` for the agent container, and `"egress"` for the proxy's own log lines (blocked hosts, for example). Proxy lines never contain secret values.
-
-When the run ends, the runner sends exactly one `agent.exit`:
-
-```json
-{ "type": "agent.exit", "id": "task-uuid", "exitCode": 0, "timedOut": false, "canceled": false, "error": null }
-```
-
-- `exitCode` is the agent container's exit code, and `null` when the container was killed or never started.
-- `error` is a short message when the agent never ran: `"agents are disabled on this runner"`, `"docker is not available"`, `"image not allowed: <image>"`, `"runner busy (2 agents running)"`, `"invalid env key"`, or a Docker failure. It never contains a secret value.
+- `labels` are set on the agent container as given. `routini.managed=true` and `routini.run` are the ones the runner matches on later, so the server always sends them.
+- `egress.network` is the per-org internal network. The runner creates it if it does not exist.
+- `egress.session` is passed through to the egress proxy untouched (see step 3). It reaches the runner over the existing TLS WebSocket and is never written to disk, never logged, and never passed to the agent container.
 
 To cancel, the server sends:
 
@@ -269,11 +254,48 @@ To cancel, the server sends:
 { "type": "agent.cancel", "id": "task-uuid" }
 ```
 
-On cancel or timeout the runner stops the agent container with a 10 s grace period, then kills it, and reports `canceled: true` or `timedOut: true`. Cleanup (step 7) runs either way.
+The runner streams container output one frame per **line**, with exactly the framing of `exec.output` (2.3): lines split on `\n`, a trailing `\r` stripped, invalid UTF-8 replaced with U+FFFD, lines longer than 16 KiB split into 16 KiB pieces, and an unterminated final line flushed at exit. `stream` is `"stdout"` or `"stderr"`.
 
-**If the control connection drops,** the runner cancels every running agent, exactly as it does for exec: the results can no longer be delivered, and leaving the proxy alive would keep real credentials in memory on an unsupervised host. The runner does not re-send output after reconnecting.
+```json
+{ "type": "agent.output", "id": "task-uuid", "stream": "stdout", "data": "one line" }
+```
 
-**On startup,** before it sends `hello`, the runner removes every container and network left over from an earlier process (those labelled `routini.agent=1`). A crash or a hard restart must never leave an agent running with a live proxy.
+Every `agent.start` is answered by exactly one `agent.exit`:
+
+```json
+{ "type": "agent.exit", "id": "task-uuid", "exitCode": 0, "timedOut": false, "canceled": false, "error": null,
+  "egress": { "requests": 41, "intercepted": 12, "blocked": ["evil.example"] } }
+```
+
+- `exitCode` is `null` when the container never ran, was killed, or anything failed.
+- `error` is `null` on a clean run, otherwise a short message.
+- `egress` holds the session's counters, or `null` when they could not be read.
+
+The runner's steps, in order:
+
+1. **Refusals.** Each one is answered at once with a single `agent.exit` carrying `exitCode: null` and this `error`, and nothing is created:
+   - `"agents are disabled on this runner"`, when `agents` was not advertised, either because the config flag is off or because Docker did not answer at startup.
+   - `"image not allowed by agentImagePrefixes: <ref>"`, where `<ref>` is the rejected reference. Checked for both the agent image and the egress image.
+   - `"runner busy (N agents running)"`, where `N` is the number already running, once `maxConcurrentAgents` is reached.
+   - `"invalid env key"`, when an `env` key does not match `^[A-Za-z_][A-Za-z0-9_]*$`.
+
+   No refusal message ever contains a secret value.
+2. **Egress.** Ensure the egress image and the `routini-egress` container, ensure the internal network `egress.network`, and connect `routini-egress` to it with the alias `routini-egress`. One `routini-egress` container serves every task on the host; it is reused, not recreated per task.
+3. **Session.** `PUT <control>/sessions/<token>` with the session JSON as the body and `Authorization: Bearer <secret>`, then `GET <control>/ca`, which returns `{"pem": "..."}`. `<control>` is the loopback URL of `routini-egress`, and `<secret>` is the egress secret known only to the runner and that container.
+4. **Environment.** On top of `env`, the agent container gets:
+   - `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy` and `http_proxy` = `http://routini:<token>@routini-egress:3128`
+   - `NO_PROXY=""` and `no_proxy=""`, so nothing bypasses the proxy
+   - `GIT_HTTP_PROXY_AUTHMETHOD=basic`
+   - `ROUTINI_CA_PEM=<pem>`, the PEM from step 3
+5. **Run.** Ensure the agent image, honouring `pull`, then run it on the internal network, streaming `agent.output` as described above.
+6. **Stop.** On `timeoutSec` elapsing or on `agent.cancel`, stop the container with a 10 s grace, then kill it. The exit reports `timedOut: true` or `canceled: true`.
+7. **Clean up.** Always `DELETE <control>/sessions/<token>` and report the stats it returns in `agent.exit.egress`, which is `null` when that call failed. The container is always removed, on every path.
+
+Any failure at any step produces one `agent.exit` with `exitCode: null` and a short `error`, after the clean-up of step 7.
+
+**If the control connection drops,** the runner kills all agent containers (the ones labelled `routini.managed=true` plus `routini.run`) and closes their sessions, for the same reason exec tasks are cancelled: their results can no longer be delivered. Closing the sessions also drops the real credentials from the proxy's memory, so nothing usable is left on an unsupervised host. The runner does not re-send output after reconnecting. `routini-egress` stays up, because it is shared and holds the CA.
+
+**Secrets.** Real credentials appear only in `egress.session.bindings`. The runner hands them to the local egress proxy over loopback, where they live in memory only, for the life of the session. They are never written to disk, never logged, and never visible inside the agent container: there, `ANTHROPIC_API_KEY` is the placeholder `routini-brokered-credential`, and the proxy swaps in the real value for allowed hosts according to the bindings.
 
 ## 3. Versioning
 
