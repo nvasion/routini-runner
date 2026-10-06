@@ -99,13 +99,16 @@ func validateRef(ref string) error {
 	return nil
 }
 
+// validateEnv allows newlines in values: the Engine API carries Env as JSON,
+// and agents need multi-line values (ROUTINI_CA_PEM, prompts). Only NUL, which
+// cannot appear in a process environment, is refused.
 func validateEnv(env map[string]string) error {
 	for k, v := range env {
 		if !envKeyRe.MatchString(k) {
 			return fmt.Errorf("dockerx: invalid env key %q", k)
 		}
-		if strings.ContainsAny(v, "\x00\n") {
-			return fmt.Errorf("dockerx: env value for %q contains a NUL or newline", k)
+		if strings.ContainsRune(v, 0) {
+			return fmt.Errorf("dockerx: env value for %q contains a NUL", k)
 		}
 	}
 	return nil

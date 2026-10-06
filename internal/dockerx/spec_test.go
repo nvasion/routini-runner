@@ -145,7 +145,11 @@ func TestRunSpecValidate(t *testing.T) {
 		{"bad network", func(s *RunSpec) { s.Network = "net work" }, "invalid network name"},
 		{"bad runtime", func(s *RunSpec) { s.Runtime = "runsc; sh" }, "invalid runtime"},
 		{"bad env key", func(s *RunSpec) { s.Env = map[string]string{"1BAD": "x"} }, "invalid env key"},
-		{"env value with newline", func(s *RunSpec) { s.Env = map[string]string{"K": "a\nb"} }, "NUL or newline"},
+		{"env value with NUL", func(s *RunSpec) { s.Env = map[string]string{"K": "a\x00b"} }, "contains a NUL"},
+		// Multi-line values are normal: the egress CA (ROUTINI_CA_PEM) and prompts.
+		{"multi-line env value", func(s *RunSpec) {
+			s.Env = map[string]string{"ROUTINI_CA_PEM": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n", "ROUTINI_PROMPT": "line one\nline two"}
+		}, ""},
 		{"empty label key", func(s *RunSpec) { s.Labels = map[string]string{"": "x"} }, "label key is empty"},
 		{"label key with equals", func(s *RunSpec) { s.Labels = map[string]string{"a=b": "x"} }, "invalid label key"},
 		{"label value with NUL", func(s *RunSpec) { s.Labels = map[string]string{"a": "b\x00"} }, "NUL or newline"},
