@@ -12,11 +12,19 @@ project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
   containers on the local Docker daemon. It is advertised to the server as the
   `agents` capability only when `capabilities.agents` is `true` in
   `config.json` **and** the local Docker daemon answered a ping at startup;
-  host facts gain a `docker` object (`available`, `version`) when the daemon is
-  reachable. Agent containers run unprivileged (`1000:1000` by default) with
-  all capabilities dropped, `no-new-privileges`, and CPU, memory and PID
-  limits; outbound traffic goes through the managed `routini-egress` container
-  on an internal bridge network.
+  host facts gain a `docker` object (`available`, `version`, `agentsRunning`,
+  `maxAgents`) when the daemon is reachable. Agent containers run unprivileged
+  (`1000:1000` by default) with all capabilities dropped,
+  `no-new-privileges`, and CPU, memory and PID limits; outbound traffic goes
+  through the managed `routini-egress` container on an internal bridge
+  network.
+- **Agent frames** `agent.start`, `agent.cancel`, `agent.output` and
+  `agent.exit` (PROTOCOL.md section 2.6). Each `agent.start` is answered by
+  exactly one `agent.exit`; the egress session that holds the real
+  credentials is opened on the local proxy before the container starts and
+  always closed afterwards, and the agent container only ever sees the
+  session token and the proxy's CA. Dropping the control connection cancels
+  every running agent task and closes its session.
 - New config fields: `agentImagePrefixes` (default `["ghcr.io/nvasion/"]`,
   the only image references the runner will pull or run),
   `maxConcurrentAgents` (default 2), `dockerHost` (default

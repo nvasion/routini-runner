@@ -31,6 +31,24 @@ type Facts struct {
 	DiskTotalGb *float64 `json:"diskTotalGb,omitempty"`
 	DiskUsedPct *int     `json:"diskUsedPct,omitempty"`
 	Addresses   []string `json:"addresses,omitempty"`
+	Docker      *Docker  `json:"docker,omitempty"`
+}
+
+// Docker reports the local Docker daemon and this runner's agent capacity
+// (PROTOCOL.md section 2.2). Collect never fills it in: only the control
+// connection knows whether the daemon answered its startup ping and how many
+// agent tasks are running, so it attaches this object itself. The whole
+// object is omitted when Docker is unreachable.
+type Docker struct {
+	// Available says whether the daemon answered at the last probe.
+	Available bool `json:"available"`
+	// Version is what its ping reported.
+	Version string `json:"version"`
+	// AgentsRunning is the number of agent tasks running now.
+	AgentsRunning int `json:"agentsRunning"`
+	// MaxAgents is the configured maxConcurrentAgents, so a console can
+	// show spare capacity.
+	MaxAgents int `json:"maxAgents"`
 }
 
 func ptr[T any](v T) *T { return &v }

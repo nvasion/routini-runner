@@ -154,9 +154,11 @@ sudo usermod -aG docker routini-runner   # once, if not done by the installer
 sudo systemctl restart routini-runner
 ```
 
-The capability is read at startup, so the restart is required. Check it with
-`routini-runner facts`, which reports `docker.available` and the daemon
-version when Docker is reachable.
+The capability is read at startup, so the restart is required. The runner
+probes the daemon once while starting and logs either `agents enabled: docker
+<version>` or a single warning that Docker is unavailable; only in the first
+case does it offer `agents` to Routini and report the daemon in the `docker`
+object of its facts (`available`, `version`, `agentsRunning`, `maxAgents`).
 
 ### Disabling agents
 
