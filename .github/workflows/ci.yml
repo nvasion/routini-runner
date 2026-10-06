@@ -31,3 +31,6 @@ jobs:
 
       - name: go test
         run: go test -race -count=1 ./...
+
+      - name: install.sh tests
+        run: sh scripts/install_test.sh
