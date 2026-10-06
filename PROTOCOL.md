@@ -23,7 +23,7 @@ The runner sends:
 POST {url}/api/runner/enroll
 Content-Type: application/json
 
-{ "token": "rre_xxx", "name": "web-01", "hostname": "web-01.prod", "os": "linux", "arch": "amd64", "version": "0.1.0" }
+{ "token": "rre_xxx", "name": "web-01", "hostname": "web-01.prod", "os": "linux", "arch": "amd64", "version": "0.2.0" }
 ```
 
 `name` is optional. Without it, the server uses the name given to the enrollment token, or else the hostname.
@@ -43,18 +43,20 @@ The runner writes its config file at mode 0600, creating the parent directory at
 
 ```json
 { "url": "https://routini.example.com", "runnerId": "uuid", "credential": "rrc_xxx", "caFile": null,
-  "capabilities": { "exec": true, "pty": true, "agents": false }, "maxConcurrentExec": 8 }
+  "capabilities": { "exec": true, "pty": true, "agents": false },
+  "maxConcurrentExec": 8, "maxConcurrentAgents": 2,
+  "agentImagePrefixes": ["ghcr.io/nvasion/"], "dockerHost": "", "containerRuntime": "" }
 ```
 
-Admins can edit `capabilities` and `maxConcurrentExec` by hand. For example, `"pty": false` turns off interactive terminals on that server.
+Admins can edit `capabilities` and the limits by hand. For example, `"pty": false` turns off interactive terminals on that server.
 
-`capabilities.agents` enables containerised agent tasks (section 2.6). Enrollment writes it as `false`, because it needs a local Docker daemon. Setting it to `true` is not enough on its own: the runner advertises `agents` only when **both** `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup. If the ping fails, the runner starts normally, does not advertise `agents`, and refuses `agent.start`.
+`capabilities.agents` enables containerised agent tasks (section 2.6). Enrollment writes it as **false**, because it needs access to the local Docker daemon. Setting it to `true` is not enough on its own: the runner advertises `agents` only when **both** `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup. If the ping fails, the runner starts normally, does not advertise `agents`, and refuses `agent.start`.
 
-Optional keys that only affect agents:
+Optional keys that only matter once `capabilities.agents` is true:
 
-- `agentImagePrefixes`: image references the runner is willing to run. Missing or empty means `["ghcr.io/nvasion/"]`.
-- `maxConcurrentAgents`: default 2. Any value that is not positive means 2.
-- `dockerHost`: default `""`, meaning `unix:///var/run/docker.sock`. The `DOCKER_HOST` environment variable overrides it.
+- `agentImagePrefixes`: the image allow-list, the image references the runner is willing to run. Missing or empty means `["ghcr.io/nvasion/"]`. The runner refuses `agent.start` for any agent or egress image that does not start with one of these prefixes.
+- `maxConcurrentAgents`: caps parallel agent containers. Missing or not positive means the default, 2.
+- `dockerHost`: the Docker endpoint. Default `""`, meaning `unix:///var/run/docker.sock`. The `DOCKER_HOST` environment variable overrides it.
 - `containerRuntime`: default `""`, meaning Docker's default runtime. `"runsc"` selects gVisor.
 
 ## 2. Control connection (WebSocket)
@@ -84,11 +86,11 @@ All messages are **JSON text frames**, one object each, with a `type` field. Unk
 The runner sends `hello` immediately after the connection opens:
 
 ```json
-{ "type": "hello", "protocol": 1, "version": "0.1.0", "hostname": "web-01.prod", "os": "linux", "arch": "amd64",
+{ "type": "hello", "protocol": 1, "version": "0.2.0", "hostname": "web-01.prod", "os": "linux", "arch": "amd64",
   "capabilities": ["exec", "pty", "agents"], "facts": { ...see 2.2 } }
 ```
 
-`capabilities` lists only the features the runner will actually serve. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`.
+`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. A server must not send the frames of a feature it was not offered.
 
 The server replies with `welcome`:
 
@@ -112,14 +114,14 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
   "memTotalMb": 7972, "memUsedPct": 41,
   "diskTotalGb": 78.6, "diskUsedPct": 63,
   "addresses": ["10.0.0.11", "fd00::11"],
-  "docker": { "available": true, "version": "27.3.1" }
+  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2 }
 }
 ```
 
 - `memUsedPct` is `(MemTotal - MemAvailable) / MemTotal`.
 - `diskUsedPct` covers `/` and excludes reserved blocks: `(total - free) / (total - free + avail)`, which is the same as `df`.
 - `addresses` lists non-loopback interface addresses.
-- `docker` reports the local Docker daemon: `version` is what its ping returned. The whole object is omitted when Docker is unreachable.
+- `docker` reports the local Docker daemon: `available` says whether it answered at the last probe and `version` is what its ping returned. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. The whole object is omitted when Docker is unreachable; an older runner omits it too, which is why the protocol version stays 1.
 
 ### 2.3 Exec: run a command
 
@@ -213,7 +215,9 @@ The server may also close the connection with WebSocket close code `4000` (anoth
 
 ### 2.6 Agents
 
-An agent task runs a container image instead of a shell command, on an internal Docker network with no route to the internet. Its only way out is `routini-egress`, a local proxy that terminates TLS for the hosts the server allowed and injects the real credentials. The runner serves agent tasks only when it advertised the `agents` capability (2.1).
+An agent task runs a container image instead of a shell command, on an internal Docker network with no route to the internet. It runs on **this** host's Docker, with the same credential guarantee as the Routini sandbox: the agent container holds **placeholders**, never real keys, and its only way out is `routini-egress`, a local proxy that terminates TLS for the hosts the server allowed, enforces the org's allow-list and injects the real credentials.
+
+These frames exist only for a runner that advertised the `agents` capability in `hello` (section 2.1). They are additive and gated by that capability, so the protocol version stays **1**.
 
 The server starts an agent:
 
@@ -237,10 +241,12 @@ The server starts an agent:
 ```
 
 - `pull` is `"missing"` (pull only when the image is absent) or `"always"`.
-- `user` defaults to `1000:1000` and `pidsLimit` to 512. `cpus` becomes a CPU quota, `memoryMb` a memory limit in MiB.
+- `user` defaults to `1000:1000` and `pidsLimit` to 512. `cpus` becomes a CPU quota, `memoryMb` a memory limit in MiB. `timeoutSec` has no hosted clamp: fleet agent time is the customer's own compute.
+- `image` and `egress.image` must both match a prefix in `agentImagePrefixes`, otherwise the runner refuses the task.
+- `env` keys must match `^[A-Za-z_][A-Za-z0-9_]*$`, as for exec. The values the agent sees are placeholders.
 - `labels` are set on the agent container as given. `routini.managed=true` and `routini.run` are the ones the runner matches on later, so the server always sends them.
 - `egress.network` is the per-org internal network. The runner creates it if it does not exist.
-- `egress.session` is passed through to the egress proxy untouched (see step 3).
+- `egress.session` is passed through to the egress proxy untouched (see step 3). It reaches the runner over the existing TLS WebSocket and is never written to disk, never logged, and never passed to the agent container.
 
 To cancel, the server sends:
 
@@ -268,9 +274,12 @@ Every `agent.start` is answered by exactly one `agent.exit`:
 The runner's steps, in order:
 
 1. **Refusals.** Each one is answered at once with a single `agent.exit` carrying `exitCode: null` and this `error`, and nothing is created:
-   - `"agents are disabled on this runner"`, when `agents` was not advertised.
+   - `"agents are disabled on this runner"`, when `agents` was not advertised, either because the config flag is off or because Docker did not answer at startup.
    - `"image not allowed by agentImagePrefixes: <ref>"`, where `<ref>` is the rejected reference. Checked for both the agent image and the egress image.
    - `"runner busy (N agents running)"`, where `N` is the number already running, once `maxConcurrentAgents` is reached.
+   - `"invalid env key"`, when an `env` key does not match `^[A-Za-z_][A-Za-z0-9_]*$`.
+
+   No refusal message ever contains a secret value.
 2. **Egress.** Ensure the egress image and the `routini-egress` container, ensure the internal network `egress.network`, and connect `routini-egress` to it with the alias `routini-egress`. One `routini-egress` container serves every task on the host; it is reused, not recreated per task.
 3. **Session.** `PUT <control>/sessions/<token>` with the session JSON as the body and `Authorization: Bearer <secret>`, then `GET <control>/ca`, which returns `{"pem": "..."}`. `<control>` is the loopback URL of `routini-egress`, and `<secret>` is the egress secret known only to the runner and that container.
 4. **Environment.** On top of `env`, the agent container gets:
@@ -284,7 +293,7 @@ The runner's steps, in order:
 
 Any failure at any step produces one `agent.exit` with `exitCode: null` and a short `error`, after the clean-up of step 7.
 
-**If the control connection drops,** the runner kills all agent containers (the ones labelled `routini.managed=true` plus `routini.run`) and closes their sessions, for the same reason exec tasks are cancelled: their results can no longer be delivered. `routini-egress` stays up, because it is shared and holds the CA.
+**If the control connection drops,** the runner kills all agent containers (the ones labelled `routini.managed=true` plus `routini.run`) and closes their sessions, for the same reason exec tasks are cancelled: their results can no longer be delivered. Closing the sessions also drops the real credentials from the proxy's memory, so nothing usable is left on an unsupervised host. The runner does not re-send output after reconnecting. `routini-egress` stays up, because it is shared and holds the CA.
 
 **Secrets.** Real credentials appear only in `egress.session.bindings`. The runner hands them to the local egress proxy over loopback, where they live in memory only, for the life of the session. They are never written to disk, never logged, and never visible inside the agent container: there, `ANTHROPIC_API_KEY` is the placeholder `routini-brokered-credential`, and the proxy swaps in the real value for allowed hosts according to the bindings.
 
