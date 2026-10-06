@@ -5,7 +5,9 @@
 #
 # `up` enrolls on first start (when the config file is missing), then runs.
 
-FROM golang:1.22 AS build
+# The build stage runs on the build host and cross-compiles for the target
+# platform, so multi-arch builds (buildx --platform) need no emulated Go.
+FROM --platform=$BUILDPLATFORM golang:1.22 AS build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 COPY go.mod go.sum ./
@@ -13,9 +15,11 @@ RUN go mod download
 COPY . .
 # Leave VERSION empty to keep the version compiled into internal/version.
 ARG VERSION=""
+ARG TARGETOS=linux
+ARG TARGETARCH
 RUN LDFLAGS="-s -w"; \
     if [ -n "$VERSION" ]; then LDFLAGS="$LDFLAGS -X github.com/nvasion/routini-runner/internal/version.Version=${VERSION#v}"; fi; \
-    go build -trimpath -ldflags "$LDFLAGS" -o /out/routini-runner ./cmd/routini-runner
+    GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -ldflags "$LDFLAGS" -o /out/routini-runner ./cmd/routini-runner
 
 FROM debian:bookworm-slim
 RUN apt-get update \
