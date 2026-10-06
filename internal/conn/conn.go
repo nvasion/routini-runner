@@ -20,7 +20,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/nvasion/routini-runner/internal/agentx"
 	"github.com/nvasion/routini-runner/internal/config"
+	"github.com/nvasion/routini-runner/internal/dockerx"
 	"github.com/nvasion/routini-runner/internal/enroll"
 	"github.com/nvasion/routini-runner/internal/execx"
 	"github.com/nvasion/routini-runner/internal/facts"
@@ -38,6 +40,10 @@ const ConnectPath = "/api/runner/connect"
 // CloseReplaced is the close code the server uses when another connection
 // with the same credential replaced this one.
 const CloseReplaced = 4000
+
+// DockerPingTimeout bounds the startup probe of the local Docker daemon.
+// Agents stay unavailable when it does not answer in time.
+const DockerPingTimeout = 5 * time.Second
 
 // Sentinel causes of a FatalError.
 var (
@@ -73,6 +79,11 @@ type Options struct {
 	Lookup   urlcheck.Lookup    // DNS for the plaintext URL rule; nil: system resolver
 	Facts    func() facts.Facts // nil: facts.Collect
 	Hostname string             // "": os.Hostname
+
+	// Docker replaces the client New would build from Config.DockerHost. It
+	// is only used when Config.Capabilities.Agents is true, and is pinged
+	// like any other; tests inject a fake daemon through it.
+	Docker dockerx.Docker
 }
 
 // Runner holds the state that outlives individual connections.
@@ -84,6 +95,15 @@ type Runner struct {
 	dialer *websocket.Dialer
 	execs  *execx.Manager
 	ptys   *ptyx.Manager
+	agents *agentx.Manager
+	docker dockerInfo
+}
+
+// dockerInfo is the outcome of the startup Docker probe. Agents are served
+// only when it succeeded (PROTOCOL.md section 2.1).
+type dockerInfo struct {
+	available bool
+	version   string
 }
 
 // New validates opts and returns a Runner.
@@ -144,6 +164,20 @@ func New(opts Options) (*Runner, error) {
 		dialer.NetDialContext = urlcheck.GuardedDialContext(&net.Dialer{Timeout: 15 * time.Second}, opts.Lookup)
 	}
 	cfg := opts.Config
+	// Agents need the local Docker daemon. A daemon that does not answer
+	// leaves exec and pty untouched: the runner just does not offer agents.
+	docker, client := probeDocker(cfg, opts.Docker, opts.Logger)
+	agents, err := agentx.New(agentx.Options{
+		Docker:        client,
+		Enabled:       docker.available,
+		ImagePrefixes: cfg.AgentImagePrefixes,
+		MaxConcurrent: cfg.MaxConcurrentAgents,
+		Runtime:       cfg.ContainerRuntime,
+		Logger:        opts.Logger,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &Runner{
 		opts:   opts,
 		cfg:    cfg,
@@ -157,7 +191,46 @@ func New(opts Options) (*Runner, error) {
 		ptys: ptyx.NewManager(ptyx.Options{
 			Enabled: cfg.Capabilities.Pty, HangupGrace: opts.HangupGrace, Logger: opts.Logger,
 		}),
+		agents: agents,
+		docker: docker,
 	}, nil
+}
+
+// probeDocker decides whether this runner serves agents at all: it needs the
+// config flag and a daemon that answers. Any failure is reported as a single
+// warning and leaves agents unavailable, which is not fatal because exec and
+// pty do not depend on Docker.
+func probeDocker(cfg *config.Config, injected dockerx.Docker, logger *log.Logger) (dockerInfo, dockerx.Docker) {
+	if !cfg.Capabilities.Agents {
+		return dockerInfo{}, nil
+	}
+	client, version, err := dialDocker(cfg, injected)
+	if err != nil {
+		logger.Printf("agents are enabled in the config but Docker is unavailable: %v", err)
+		return dockerInfo{}, nil
+	}
+	logger.Printf("agents enabled: docker %s, up to %d running at a time", version, cfg.MaxConcurrentAgents)
+	return dockerInfo{available: true, version: version}, client
+}
+
+// dialDocker takes the injected client or builds one from the config, then
+// pings it once to learn the daemon's version.
+func dialDocker(cfg *config.Config, injected dockerx.Docker) (dockerx.Docker, string, error) {
+	client := injected
+	if client == nil {
+		c, err := dockerx.New(cfg.DockerHost)
+		if err != nil {
+			return nil, "", err
+		}
+		client = c
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), DockerPingTimeout)
+	defer cancel()
+	version, err := client.Ping(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return client, version, nil
 }
 
 // Run keeps the control connection up until ctx is canceled (it then shuts
@@ -279,6 +352,9 @@ type welcomeMsg struct {
 	Name     string `json:"name"`
 }
 
+// capabilities lists the features this runner will actually serve. "agents"
+// needs both the config flag and a Docker daemon that answered the startup
+// ping (PROTOCOL.md section 2.1).
 func (r *Runner) capabilities() []string {
 	caps := []string{}
 	if r.cfg.Capabilities.Exec {
@@ -287,7 +363,25 @@ func (r *Runner) capabilities() []string {
 	if r.cfg.Capabilities.Pty {
 		caps = append(caps, "pty")
 	}
+	if r.cfg.Capabilities.Agents && r.docker.available {
+		caps = append(caps, "agents")
+	}
 	return caps
+}
+
+// hostFacts collects the host facts and adds the docker object, which only
+// the connection can fill in (PROTOCOL.md section 2.2).
+func (r *Runner) hostFacts() facts.Facts {
+	f := r.opts.Facts()
+	if r.docker.available {
+		f.Docker = &facts.Docker{
+			Available:     true,
+			Version:       r.docker.version,
+			AgentsRunning: r.agents.Running(),
+			MaxAgents:     r.cfg.MaxConcurrentAgents,
+		}
+	}
+	return f
 }
 
 // session runs one connection from dial to close.
@@ -357,7 +451,7 @@ func (r *Runner) session(ctx context.Context) result {
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
 		Capabilities: r.capabilities(),
-		Facts:        r.opts.Facts(),
+		Facts:        r.hostFacts(),
 	}
 	if err := c.send(hello); err != nil {
 		res.err = fmt.Errorf("send hello: %w", err)
@@ -372,9 +466,12 @@ func (r *Runner) session(ctx context.Context) result {
 		return res
 	}
 	// The connection dropped (or the runner was revoked): results can no
-	// longer be delivered, so stop everything without reporting.
+	// longer be delivered, so stop everything without reporting. Canceling
+	// the agents also closes their egress sessions, which drops the real
+	// credentials from the proxy's memory (PROTOCOL.md section 2.6).
 	r.execs.AbortAll()
 	r.ptys.AbortAll()
+	r.agents.CancelAll()
 	if res.fatal != nil {
 		c.closeWith(websocket.CloseNormalClosure, "")
 	}
@@ -383,16 +480,21 @@ func (r *Runner) session(ctx context.Context) result {
 	return res
 }
 
-// gracefulClose runs on SIGINT/SIGTERM: cancel running commands (their
-// exec.exit is still sent), close terminals, then close the socket with 1000.
+// gracefulClose runs on SIGINT/SIGTERM: cancel running commands and agent
+// tasks (their exec.exit and agent.exit are still sent), close terminals,
+// then close the socket with 1000.
 func (r *Runner) gracefulClose(c *wsConn, readDone <-chan struct{}) {
-	r.log.Printf("shutting down: canceling running commands and closing terminals")
+	r.log.Printf("shutting down: canceling running commands and agent tasks, and closing terminals")
 	r.execs.Shutdown()
 	r.ptys.Shutdown()
+	// Agents are stopped too: waiting for them lets each one send its
+	// agent.exit and close its egress session while the socket is still up.
+	r.agents.Shutdown()
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); r.execs.Wait(r.opts.KillGrace + time.Second) }()
 	go func() { defer wg.Done(); r.ptys.Wait(r.opts.HangupGrace + time.Second) }()
+	go func() { defer wg.Done(); r.agents.Wait(agentx.StopGrace + time.Second) }()
 	wg.Wait()
 	r.execs.AbortAll()
 	r.ptys.AbortAll()
@@ -512,6 +614,19 @@ func (r *Runner) dispatch(st *dispatchState, data []byte) error {
 		r.execs.Start(m, st.send)
 	case "exec.cancel":
 		r.execs.Cancel(env.ID)
+	case "agent.start":
+		var m agentx.StartMsg
+		if err := json.Unmarshal(data, &m); err != nil {
+			// The frame carries the egress session, so only the id is logged.
+			r.log.Printf("ignoring malformed agent.start %q", env.ID)
+			if env.ID != "" {
+				st.send(agentx.ErrorExit(env.ID, "invalid agent.start message"))
+			}
+			return nil
+		}
+		r.agents.Start(m, st.send)
+	case "agent.cancel":
+		r.agents.Cancel(env.ID)
 	case "pty.open":
 		var m ptyx.OpenMsg
 		if err := json.Unmarshal(data, &m); err != nil {
@@ -556,7 +671,7 @@ func (r *Runner) factsLoop(send func(any), done <-chan struct{}) {
 		case <-done:
 			return
 		case <-t.C:
-			send(factsMsg{Type: "facts", Facts: r.opts.Facts()})
+			send(factsMsg{Type: "facts", Facts: r.hostFacts()})
 		}
 	}
 }

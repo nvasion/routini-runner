@@ -5,7 +5,8 @@
 terminals there. It connects **out** to your Routini server over a WebSocket
 and never listens on a port.
 
-The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md).
+The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md); release notes are
+in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security model
 
@@ -30,6 +31,10 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md).
   `"capabilities": {"exec": true, "pty": false}` disables interactive
   terminals; `"exec": false` disables commands. `maxConcurrentExec` caps
   parallel commands (default 8).
+- **Agents are off by default.** Running Routini agents in local Docker
+  containers has to be switched on deliberately, because it makes the runner's
+  user root-equivalent on the host. See
+  [Running agents on this server](#running-agents-on-this-server).
 - **Removal is final.** If an admin removes the runner in Routini, or its
   credential is rejected, the runner exits with code 78 and systemd does not
   restart it.
@@ -40,7 +45,7 @@ On the server, as root:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nvasion/routini-runner/main/scripts/install.sh \
-  | sudo sh -s -- --url https://routini.example.com --token rre_... [--name web-01] [--version v0.1.0]
+  | sudo sh -s -- --url https://routini.example.com --token rre_... [--name web-01] [--version v0.2.0] [--enable-agents]
 ```
 
 The installer:
@@ -53,7 +58,11 @@ The installer:
 4. creates the system user `routini-runner` (home `/var/lib/routini-runner`);
 5. enrolls as that user, writing `/etc/routini-runner/config.json`
    (the directory is owned by `routini-runner`, mode 0700);
-6. installs `routini-runner.service` and runs `systemctl enable --now`.
+6. with `--enable-agents`: sets `capabilities.agents` to `true` in that config
+   and adds `routini-runner` to the `docker` group, after printing the
+   root-equivalence warning (see
+   [Running agents on this server](#running-agents-on-this-server));
+7. installs `routini-runner.service` and runs `systemctl enable --now`.
 
 Running it again upgrades the binary and restarts the service; if the config
 already exists, enrollment is skipped and `--url`/`--token` are not needed.
@@ -82,6 +91,104 @@ there to keep the enrollment across container re-creation (the token is
 single-use). `--init` is recommended so that orphaned background processes
 started by commands are reaped.
 
+## Running agents on this server
+
+Routini can run **agents** (for example `routini-agent-claude`) as containers
+on this server's own Docker daemon instead of on Routini's infrastructure.
+This is **off by default** and has to be switched on per server.
+
+### Requirements
+
+- **Docker 24 or newer**, running locally, reachable at
+  `unix:///var/run/docker.sock` (or at `dockerHost` / `$DOCKER_HOST`). The
+  runner only advertises the `agents` capability when `capabilities.agents` is
+  `true` *and* the daemon answered a ping at startup, so a missing or stopped
+  daemon is not fatal — agents are simply not offered.
+- **Outbound HTTPS** from this server to:
+  - `ghcr.io` (and `pkg-containers.githubusercontent.com`) to pull agent
+    images;
+  - the **model hosts** the agent talks to (for example
+    `api.anthropic.com`);
+  - the **repository hosts** the agent clones from (for example
+    `github.com`).
+
+  No inbound ports are opened: the runner still only dials out.
+- Enough room for the agents: each one gets its own container with CPU, memory
+  and PID limits, and at most `maxConcurrentAgents` run at a time.
+
+### Warning: the docker group is root-equivalent
+
+> **Putting the runner's user in the `docker` group makes it root on this
+> host.** Anyone who can talk to the Docker socket can start a container that
+> mounts `/` and write anywhere as root — the `docker` group is therefore
+> *root-equivalent*, and the usual user/sudo boundaries do not contain it.
+
+Enable agents only on a host you are willing to hand over to the agents that
+run there — ideally a dedicated VM that holds no other secrets. Agent
+containers themselves run unprivileged (`1000:1000` by default) with all
+Linux capabilities dropped, `no-new-privileges`, and on an internal network
+whose egress goes through Routini's managed proxy container; the
+root-equivalence applies to the *runner's* access to the daemon, not to the
+agents.
+
+### Enabling agents
+
+Either at install time:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nvasion/routini-runner/main/scripts/install.sh \
+  | sudo sh -s -- --url https://routini.example.com --token rre_... --enable-agents
+```
+
+or on an already-installed runner, by editing
+`/etc/routini-runner/config.json`:
+
+```json
+{
+  "capabilities": { "exec": true, "pty": true, "agents": true }
+}
+```
+
+```sh
+sudo usermod -aG docker routini-runner   # once, if not done by the installer
+sudo systemctl restart routini-runner
+```
+
+The capability is read at startup, so the restart is required. The runner
+probes the daemon once while starting and logs either `agents enabled: docker
+<version>` or a single warning that Docker is unavailable; only in the first
+case does it offer `agents` to Routini and report the daemon in the `docker`
+object of its facts (`available`, `version`, `agentsRunning`, `maxAgents`).
+
+### Disabling agents
+
+Set `"agents": false` under `capabilities` (or remove the key) and restart:
+
+```sh
+sudo systemctl restart routini-runner
+```
+
+To also drop the root-equivalent access, remove the group membership:
+
+```sh
+sudo gpasswd -d routini-runner docker
+sudo systemctl restart routini-runner
+```
+
+Running agents are stopped when the runner shuts down; disabling the
+capability only prevents new ones.
+
+### Agent settings
+
+All of these live in `config.json` next to `capabilities`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `agentImagePrefixes` | `["ghcr.io/nvasion/"]` | Image references the runner is allowed to pull and run. A request for an image that does not start with one of these prefixes is rejected. |
+| `maxConcurrentAgents` | `2` | Cap on agents running at the same time. Any value that is not positive means 2. |
+| `containerRuntime` | `""` (Docker's own runtime) | Set to `"runsc"` to run agents under [gVisor](https://gvisor.dev/) for kernel-level isolation. The runtime must already be registered with Docker. |
+| `dockerHost` | `""` (`unix:///var/run/docker.sock`) | Docker endpoint to use. `$DOCKER_HOST` overrides it. |
+
 ## Configuration
 
 `/etc/routini-runner/config.json` (or `--config PATH`, or
@@ -93,10 +200,18 @@ started by commands are reaped.
   "runnerId": "uuid",
   "credential": "rrc_...",
   "caFile": null,
-  "capabilities": { "exec": true, "pty": true },
-  "maxConcurrentExec": 8
+  "capabilities": { "exec": true, "pty": true, "agents": false },
+  "maxConcurrentExec": 8,
+  "agentImagePrefixes": ["ghcr.io/nvasion/"],
+  "maxConcurrentAgents": 2,
+  "dockerHost": "",
+  "containerRuntime": ""
 }
 ```
+
+Missing fields take the defaults above; see
+[Running agents on this server](#running-agents-on-this-server) for the agent
+settings.
 
 ## CLI
 
@@ -144,11 +259,12 @@ Requires Go 1.22 and Linux.
 ```sh
 go vet ./...
 go test -race ./...
+sh scripts/install_test.sh   # tests the installer helpers, changes nothing
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o routini-runner ./cmd/routini-runner
 ```
 
 Set the version with
-`-ldflags "-X github.com/nvasion/routini-runner/internal/version.Version=0.1.0"`.
+`-ldflags "-X github.com/nvasion/routini-runner/internal/version.Version=0.2.0"`.
 Tagging `vX.Y.Z` builds static linux/amd64 and linux/arm64 binaries and
 attaches them, with `sha256sums.txt`, to the GitHub release, then pushes the
 multi-arch container image to GHCR.

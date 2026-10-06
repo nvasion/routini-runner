@@ -13,6 +13,7 @@ import (
 
 	"github.com/nvasion/routini-runner/internal/config"
 	"github.com/nvasion/routini-runner/internal/testserver"
+	"github.com/nvasion/routini-runner/internal/version"
 )
 
 // syncBuffer is a goroutine-safe bytes.Buffer.
@@ -232,7 +233,7 @@ func TestUpEnrollsThenRuns(t *testing.T) {
 
 func TestVersionAndFacts(t *testing.T) {
 	code, out, _ := runCLI(t, nil, "version")
-	if code != 0 || !strings.HasPrefix(out, "routini-runner 0.1.0") {
+	if code != 0 || out != "routini-runner "+version.Version+"\n" {
 		t.Errorf("version: %d %q", code, out)
 	}
 	code, out, _ = runCLI(t, nil, "facts")
