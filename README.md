@@ -63,14 +63,17 @@ Logs: `journalctl -u routini-runner -f`.
 ## Docker
 
 ```sh
-docker build -t routini/runner:dev .
 docker run -d --init --name routini-runner \
   -e ROUTINI_RUNNER_URL=https://routini.example.com \
   -e ROUTINI_RUNNER_TOKEN=rre_... \
   -e ROUTINI_RUNNER_NAME=docker-01 \
   -v routini-runner:/home/routini-runner/.config/routini-runner \
-  routini/runner:dev
+  ghcr.io/nvasion/routini-runner:latest
 ```
+
+Release images are published for linux/amd64 and linux/arm64 as
+`ghcr.io/nvasion/routini-runner` with tags `X.Y.Z`, `X.Y` and `latest`. To
+build one yourself: `docker build -t routini/runner:dev .`
 
 The image runs `routini-runner up` as user `routini-runner` (uid 10001). On
 first start it enrolls with the environment variables and writes
@@ -147,7 +150,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o routini-runner ./cmd/routin
 Set the version with
 `-ldflags "-X github.com/nvasion/routini-runner/internal/version.Version=0.1.0"`.
 Tagging `vX.Y.Z` builds static linux/amd64 and linux/arm64 binaries and
-attaches them, with `sha256sums.txt`, to the GitHub release.
+attaches them, with `sha256sums.txt`, to the GitHub release, then pushes the
+multi-arch container image to GHCR.
 
 ## License
 
