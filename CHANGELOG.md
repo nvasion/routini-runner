@@ -4,6 +4,40 @@ All notable changes to `routini-runner` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0
+
+### Added
+
+- **Environments.** A new `environments` capability (bundled with the
+  `agents` opt-in) and `env.op`, `env.cancel`, `env.tty.open`,
+  `env.tty.input`, `env.tty.resize`, `env.tty.close`, `env.output`,
+  `env.done`, `env.tty.opened`, `env.tty.error`, `env.tty.data` and
+  `env.tty.exit` frames (PROTOCOL.md section 2.8). `internal/envx` runs each
+  `env.op` in its own goroutine and always answers with exactly one
+  `env.done`: `volume.ensure`/`volume.remove`, `network.ensure` (which
+  shares the `routini-egress` proxy agents use), `session.open`/
+  `session.close`, `container.start`/`container.remove`/`container.state`,
+  `exec` (streaming `env.output` line by line, killable by `env.cancel` or a
+  timeout) and `pull`. Up to 4 environment terminals can be open at once,
+  independent of the PTY limit. Unlike agent tasks, a dropped control
+  connection cancels running `exec` ops, closes terminals and closes egress
+  sessions, but leaves environment containers and volumes running: they are
+  long-lived state the server reconnects to.
+- `facts.docker.environmentsRunning` now reports the real count of running
+  environment containers instead of a placeholder zero.
+
+### Changed
+
+- The egress control client (`internal/agentx/control.go`) moved to its own
+  package, `internal/egressctl`, shared by agents and environments.
+- `internal/conn` now generates one egress secret per runner process and
+  hands the same value to both `internal/agentx` and the new
+  `internal/envx`, so `EnsureEgress` never sees them disagree and recreate
+  `routini-egress` out from under one another.
+- `dockerx.Docker` gained `InspectVolume`, which `container.start` uses to
+  confirm a volume carries the same `routini.environment` label as the
+  container before mounting it.
+
 ## 0.3.0
 
 ### Added

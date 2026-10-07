@@ -35,6 +35,12 @@ type fakeDocker struct {
 	imageErr    error
 	hold        chan struct{} // non-nil: EnsureEgress waits for it
 
+	// Overrides used by the environment tests; nil keeps the stub default.
+	inspectEnv  func() (dockerx.EnvInfo, error)
+	execStream  func(ctx context.Context, onLine func(string, string)) (*int, error)
+	execTTYHook func(ctx context.Context) (dockerx.TTY, error)
+	countEnv    func() (int, error)
+
 	mu    sync.Mutex
 	calls []string
 }
@@ -116,6 +122,11 @@ func (f *fakeDocker) RemoveVolume(context.Context, string) error {
 	return nil
 }
 
+func (f *fakeDocker) InspectVolume(context.Context, string) (dockerx.VolumeInfo, error) {
+	f.record("InspectVolume")
+	return dockerx.VolumeInfo{}, nil
+}
+
 func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string, error) {
 	f.record("StartEnvContainer")
 	return "", errors.New("no environment container in this test")
@@ -123,6 +134,9 @@ func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string
 
 func (f *fakeDocker) InspectEnv(context.Context, string) (dockerx.EnvInfo, error) {
 	f.record("InspectEnv")
+	if f.inspectEnv != nil {
+		return f.inspectEnv()
+	}
 	return dockerx.EnvInfo{}, nil
 }
 
@@ -133,16 +147,25 @@ func (f *fakeDocker) RemoveEnvContainer(context.Context, string) error {
 
 func (f *fakeDocker) CountEnvContainers(context.Context) (int, error) {
 	f.record("CountEnvContainers")
+	if f.countEnv != nil {
+		return f.countEnv()
+	}
 	return 0, nil
 }
 
-func (f *fakeDocker) ExecStreaming(context.Context, string, dockerx.ExecSpec, func(string, string)) (*int, error) {
+func (f *fakeDocker) ExecStreaming(ctx context.Context, _ string, _ dockerx.ExecSpec, onLine func(string, string)) (*int, error) {
 	f.record("ExecStreaming")
+	if f.execStream != nil {
+		return f.execStream(ctx, onLine)
+	}
 	return nil, errors.New("no exec in this test")
 }
 
-func (f *fakeDocker) ExecTTY(context.Context, string, uint, uint) (dockerx.TTY, error) {
+func (f *fakeDocker) ExecTTY(ctx context.Context, _ string, _, _ uint) (dockerx.TTY, error) {
 	f.record("ExecTTY")
+	if f.execTTYHook != nil {
+		return f.execTTYHook(ctx)
+	}
 	return nil, errors.New("no tty in this test")
 }
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
+	"github.com/nvasion/routini-runner/internal/egressctl"
 )
 
 // Fixtures shared by the tests. The session body holds a binding secret on
@@ -170,6 +171,11 @@ func (f *fakeDocker) RemoveVolume(context.Context, string) error {
 	return nil
 }
 
+func (f *fakeDocker) InspectVolume(context.Context, string) (dockerx.VolumeInfo, error) {
+	f.rec.add("InspectVolume")
+	return dockerx.VolumeInfo{}, nil
+}
+
 func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string, error) {
 	f.rec.add("StartEnvContainer")
 	return "", errors.New("no environment container in this test")
@@ -282,7 +288,7 @@ func newControlServer(t *testing.T, rec *recorder) *controlServer {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ca", c.handleCA)
-	mux.HandleFunc(sessionsPath, c.handleSession)
+	mux.HandleFunc(egressctl.SessionsPath, c.handleSession)
 	c.Server = httptest.NewServer(mux)
 	t.Cleanup(c.Close)
 	return c

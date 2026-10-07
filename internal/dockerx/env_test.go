@@ -372,6 +372,61 @@ func TestRemoveEnvContainerRemovesManaged(t *testing.T) {
 	}
 }
 
+func TestInspectVolumeMissing(t *testing.T) {
+	api := &fakeAPI{
+		volumeInspect: func(context.Context, string) (volume.Volume, error) {
+			return volume.Volume{}, notFound()
+		},
+	}
+	info, err := (&dockerClient{api: api}).InspectVolume(context.Background(), "routini-env-gone")
+	if err != nil {
+		t.Fatalf("InspectVolume: %v", err)
+	}
+	if !reflect.DeepEqual(info, VolumeInfo{}) {
+		t.Errorf("info = %+v, want the zero value for a missing volume", info)
+	}
+}
+
+func TestInspectVolumeFound(t *testing.T) {
+	labels := map[string]string{LabelManaged: "true", LabelEnvironment: "env-1"}
+	api := &fakeAPI{
+		volumeInspect: func(context.Context, string) (volume.Volume, error) {
+			return volume.Volume{Name: "routini-env-a", Labels: labels}, nil
+		},
+	}
+	info, err := (&dockerClient{api: api}).InspectVolume(context.Background(), "routini-env-a")
+	if err != nil {
+		t.Fatalf("InspectVolume: %v", err)
+	}
+	want := VolumeInfo{Exists: true, Labels: labels}
+	if !reflect.DeepEqual(info, want) {
+		t.Errorf("info = %+v, want %+v", info, want)
+	}
+}
+
+func TestInspectVolumeRejectsBadName(t *testing.T) {
+	api := &fakeAPI{}
+	_, err := (&dockerClient{api: api}).InspectVolume(context.Background(), "not-a-volume")
+	if err == nil || !strings.Contains(err.Error(), "invalid volume name") {
+		t.Fatalf("got %v, want a validation error", err)
+	}
+	if len(api.log()) != 0 {
+		t.Errorf("calls = %v, want none before validation passes", api.log())
+	}
+}
+
+func TestInspectVolumeInspectError(t *testing.T) {
+	api := &fakeAPI{
+		volumeInspect: func(context.Context, string) (volume.Volume, error) {
+			return volume.Volume{}, errors.New("daemon unreachable")
+		},
+	}
+	_, err := (&dockerClient{api: api}).InspectVolume(context.Background(), "routini-env-a")
+	if err == nil || !strings.Contains(err.Error(), "inspect volume") {
+		t.Fatalf("got %v, want a wrapped inspect error", err)
+	}
+}
+
 func TestEnsureVolumeCreatesWhenAbsent(t *testing.T) {
 	var created volume.CreateOptions
 	api := &fakeAPI{

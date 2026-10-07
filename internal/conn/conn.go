@@ -5,6 +5,8 @@ package conn
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"github.com/nvasion/routini-runner/internal/config"
 	"github.com/nvasion/routini-runner/internal/dockerx"
 	"github.com/nvasion/routini-runner/internal/enroll"
+	"github.com/nvasion/routini-runner/internal/envx"
 	"github.com/nvasion/routini-runner/internal/execx"
 	"github.com/nvasion/routini-runner/internal/facts"
 	"github.com/nvasion/routini-runner/internal/ptyx"
@@ -105,6 +108,7 @@ type Runner struct {
 	execs  *execx.Manager
 	ptys   *ptyx.Manager
 	agents *agentx.Manager
+	envs   *envx.Manager
 	docker dockerInfo
 
 	updater *updatex.Updater
@@ -183,17 +187,39 @@ func New(opts Options) (*Runner, error) {
 	// Agents need the local Docker daemon. A daemon that does not answer
 	// leaves exec and pty untouched: the runner just does not offer agents.
 	docker, client := probeDocker(cfg, opts.Docker, opts.Logger)
+	// One egress secret per runner process, shared by agentx and envx: both
+	// talk to the same routini-egress container, and EnsureEgress recreates
+	// it whenever the secret it sees changes, so the two packages must never
+	// disagree about it (PROTOCOL.md 2.6 and 2.8).
+	egressSecret, err := newEgressSecret()
+	if err != nil {
+		return nil, err
+	}
 	agents, err := agentx.New(agentx.Options{
 		Docker:        client,
 		Enabled:       docker.available,
 		ImagePrefixes: cfg.AgentImagePrefixes,
 		MaxConcurrent: cfg.MaxConcurrentAgents,
 		Runtime:       cfg.ContainerRuntime,
+		EgressSecret:  egressSecret,
 		Logger:        opts.Logger,
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Environments come bundled with the agents opt-in and share agentx's
+	// Enabled condition exactly (PROTOCOL.md 2.1): both need
+	// capabilities.agents and a Docker daemon that answered the startup
+	// ping.
+	envs := envx.New(envx.Options{
+		Docker:          client,
+		Enabled:         docker.available,
+		ImagePrefixes:   cfg.AgentImagePrefixes,
+		MaxEnvironments: cfg.MaxEnvironments,
+		Runtime:         cfg.ContainerRuntime,
+		EgressSecret:    egressSecret,
+		Logger:          opts.Logger,
+	})
 	// Self-update needs the root-owned helper and its sudo rule (install.sh).
 	// Without them (containers, older installs) the runner just does not
 	// offer "update".
@@ -218,10 +244,25 @@ func New(opts Options) (*Runner, error) {
 			Enabled: cfg.Capabilities.Pty, HangupGrace: opts.HangupGrace, Logger: opts.Logger,
 		}),
 		agents:  agents,
+		envs:    envs,
 		docker:  docker,
 		updater: updater,
 		updates: updates,
 	}, nil
+}
+
+// egressSecretBytes is the length of the secret internal/conn shares with
+// agentx, envx and the egress container, before hex encoding.
+const egressSecretBytes = 32
+
+// newEgressSecret returns the hex-encoded egress secret generated once per
+// runner process.
+func newEgressSecret() (string, error) {
+	b := make([]byte, egressSecretBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("conn: generate egress secret: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // probeDocker decides whether this runner serves agents at all: it needs the
@@ -416,7 +457,7 @@ func (r *Runner) hostFacts() facts.Facts {
 			Version:             r.docker.version,
 			AgentsRunning:       r.agents.Running(),
 			MaxAgents:           r.cfg.MaxConcurrentAgents,
-			EnvironmentsRunning: 0, // a later task wires the real count
+			EnvironmentsRunning: r.envs.Running(),
 			MaxEnvironments:     r.cfg.MaxEnvironments,
 		}
 	}
@@ -515,6 +556,7 @@ func (r *Runner) session(ctx context.Context) result {
 	r.execs.AbortAll()
 	r.ptys.AbortAll()
 	r.agents.CancelAll()
+	r.envs.Disconnect()
 	if res.fatal != nil {
 		c.closeWith(websocket.CloseNormalClosure, "")
 	}
@@ -670,6 +712,46 @@ func (r *Runner) dispatch(st *dispatchState, data []byte) error {
 		r.agents.Start(m, st.send)
 	case "agent.cancel":
 		r.agents.Cancel(env.ID)
+	case "env.op":
+		var m envx.OpMsg
+		if err := json.Unmarshal(data, &m); err != nil {
+			// The frame may carry a session or env values, so only the id
+			// is logged.
+			r.log.Printf("ignoring malformed env.op %q", env.ID)
+			if env.ID != "" {
+				st.send(envx.DoneMsg{Type: envx.TypeDone, ID: env.ID, Error: ptr("invalid env.op message")})
+			}
+			return nil
+		}
+		r.envs.Op(m, st.send)
+	case "env.cancel":
+		r.envs.Cancel(env.ID)
+	case "env.tty.open":
+		var m envx.TTYOpenMsg
+		if err := json.Unmarshal(data, &m); err != nil {
+			r.log.Printf("ignoring malformed env.tty.open: %v", err)
+			if env.ID != "" {
+				st.send(envx.TTYErrorMsg{Type: envx.TypeTTYError, ID: env.ID, Message: "invalid env.tty.open message"})
+			}
+			return nil
+		}
+		r.envs.OpenTTY(m, st.send)
+	case "env.tty.input":
+		var m envx.TTYInputMsg
+		if err := json.Unmarshal(data, &m); err != nil {
+			r.log.Printf("ignoring malformed env.tty.input: %v", err)
+			return nil
+		}
+		r.envs.TTYInput(m)
+	case "env.tty.resize":
+		var m envx.TTYResizeMsg
+		if err := json.Unmarshal(data, &m); err != nil {
+			r.log.Printf("ignoring malformed env.tty.resize: %v", err)
+			return nil
+		}
+		r.envs.TTYResize(m)
+	case "env.tty.close":
+		r.envs.TTYClose(env.ID)
 	case "runner.update":
 		var m updatex.Msg
 		if err := json.Unmarshal(data, &m); err != nil {

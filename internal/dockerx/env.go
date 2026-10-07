@@ -62,6 +62,22 @@ func (d *dockerClient) RemoveVolume(ctx context.Context, name string) error {
 	return nil
 }
 
+// InspectVolume reports what is known about a volume. A missing volume is
+// not an error: the zero VolumeInfo (Exists false) is returned.
+func (d *dockerClient) InspectVolume(ctx context.Context, name string) (VolumeInfo, error) {
+	if err := validatePattern("volume name", name, envNameRe); err != nil {
+		return VolumeInfo{}, err
+	}
+	v, err := d.api.VolumeInspect(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return VolumeInfo{}, nil
+	case err != nil:
+		return VolumeInfo{}, fmt.Errorf("dockerx: inspect volume %s: %w", name, err)
+	}
+	return VolumeInfo{Exists: true, Labels: v.Labels}, nil
+}
+
 // StartEnvContainer creates and starts one environment container, returning
 // its id. If the start fails, the container created for it is removed so no
 // half-created environment is left behind.

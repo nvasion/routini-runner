@@ -98,6 +98,12 @@ type EnvInfo struct {
 	EnvID   string
 }
 
+// VolumeInfo reports what InspectVolume found about a volume.
+type VolumeInfo struct {
+	Exists bool
+	Labels map[string]string
+}
+
 // TTY is an interactive exec session attached to an environment container,
 // returned by ExecTTY.
 type TTY interface {
@@ -149,6 +155,11 @@ type Docker interface {
 	// RemoveVolume removes the named volume. A missing volume is not an
 	// error, but a volume that does not carry LabelManaged=true is refused.
 	RemoveVolume(ctx context.Context, name string) error
+
+	// InspectVolume reports what is known about a volume, in particular its
+	// labels, so a caller can check they match before trusting it. A
+	// missing volume is not an error: VolumeInfo.Exists is simply false.
+	InspectVolume(ctx context.Context, name string) (VolumeInfo, error)
 
 	// StartEnvContainer creates and starts one environment container,
 	// returning its id. The container is removed if it fails to start.
