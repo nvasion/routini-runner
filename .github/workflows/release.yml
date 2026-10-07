@@ -24,9 +24,9 @@ jobs:
           go test -count=1 ./...
 
       # Produces, for each arch, routini-runner_<version>_linux_<arch>.tar.gz
-      # (version without the leading "v") containing routini-runner, LICENSE
-      # and README.md, plus sha256sums.txt. scripts/install.sh relies on
-      # these names.
+      # (version without the leading "v") containing routini-runner, the
+      # update helper routini-runner-update, LICENSE and README.md, plus
+      # sha256sums.txt. scripts/install.sh and the helper rely on these names.
       - name: Build
         env:
           TAG: ${{ github.ref_name }}
@@ -42,7 +42,8 @@ jobs:
               -ldflags "-s -w -X github.com/nvasion/routini-runner/internal/version.Version=${VERSION}" \
               -o "build/$NAME/routini-runner" ./cmd/routini-runner
             cp LICENSE README.md "build/$NAME/"
-            tar -C "build/$NAME" -czf "dist/$NAME.tar.gz" routini-runner LICENSE README.md
+            install -m 0755 scripts/routini-runner-update "build/$NAME/routini-runner-update"
+            tar -C "build/$NAME" -czf "dist/$NAME.tar.gz" routini-runner routini-runner-update LICENSE README.md
           done
           (cd dist && sha256sum *.tar.gz > sha256sums.txt)
           cat dist/sha256sums.txt

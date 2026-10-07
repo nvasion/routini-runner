@@ -62,10 +62,35 @@ The installer:
    and adds `routini-runner` to the `docker` group, after printing the
    root-equivalence warning (see
    [Running agents on this server](#running-agents-on-this-server));
-7. installs `routini-runner.service` and runs `systemctl enable --now`.
+7. installs the update helper `/usr/local/sbin/routini-runner-update` and,
+   unless `--no-remote-update` is given, the sudoers rule that lets Routini
+   update this runner (see [Updating](#updating));
+8. installs `routini-runner.service` and runs `systemctl enable --now`.
 
 Running it again upgrades the binary and restarts the service; if the config
 already exists, enrollment is skipped and `--url`/`--token` are not needed.
+
+### Updating
+
+From v0.3.0 on, Routini can update a runner from its console (Fleet → the
+host → **Update runner**). The button runs the root-owned helper
+`/usr/local/sbin/routini-runner-update` through sudo. The sudoers rule in
+`/etc/sudoers.d/routini-runner` allows the runner's user exactly two
+commands:
+
+```
+routini-runner-update --check
+routini-runner-update vX.Y.Z
+```
+
+The helper accepts nothing else from that user. It downloads the release,
+checks its sha256 against the release's `sha256sums.txt`, installs it and
+restarts the service. To opt out, delete the sudoers file, or re-run
+`install.sh --no-remote-update`. Upgrading by re-running `install.sh` always
+works.
+
+Runners installed before v0.3.0 have no helper. Re-run `install.sh` once on
+such a host; after that, updates can come from the console.
 
 Logs: `journalctl -u routini-runner -f`.
 
@@ -160,9 +185,22 @@ probes the daemon once while starting and logs either `agents enabled: docker
 case does it offer `agents` to Routini and report the daemon in the `docker`
 object of its facts (`available`, `version`, `agentsRunning`, `maxAgents`).
 
+On a host that already runs v0.3.0 or newer, root can also switch agents on
+without re-running the installer:
+
+```sh
+sudo routini-runner-update --enable-agents
+```
+
+This adds `routini-runner` to the `docker` group, sets `capabilities.agents`
+and restarts the service. Routini itself can never do this, because the
+`docker` group is root-equivalent; the helper only does it for root on the
+host. The console shows this command for hosts that cannot run agents yet.
+
 ### Disabling agents
 
-Set `"agents": false` under `capabilities` (or remove the key) and restart:
+`sudo routini-runner-update --disable-agents` undoes the above. By hand: set
+`"agents": false` under `capabilities` (or remove the key) and restart:
 
 ```sh
 sudo systemctl restart routini-runner

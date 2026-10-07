@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,9 +28,12 @@ import (
 	"github.com/nvasion/routini-runner/internal/execx"
 	"github.com/nvasion/routini-runner/internal/facts"
 	"github.com/nvasion/routini-runner/internal/ptyx"
+	"github.com/nvasion/routini-runner/internal/updatex"
 	"github.com/nvasion/routini-runner/internal/urlcheck"
 	"github.com/nvasion/routini-runner/internal/version"
 )
+
+func ptr[T any](v T) *T { return &v }
 
 // Protocol is the protocol version this runner speaks.
 const Protocol = 1
@@ -84,6 +88,11 @@ type Options struct {
 	// is only used when Config.Capabilities.Agents is true, and is pinged
 	// like any other; tests inject a fake daemon through it.
 	Docker dockerx.Docker
+
+	// UpdateHelper and UpdateExec replace the update helper's path and the
+	// way it is run (sudo); tests inject both.
+	UpdateHelper string
+	UpdateExec   updatex.Exec
 }
 
 // Runner holds the state that outlives individual connections.
@@ -97,6 +106,9 @@ type Runner struct {
 	ptys   *ptyx.Manager
 	agents *agentx.Manager
 	docker dockerInfo
+
+	updater *updatex.Updater
+	updates bool // the update helper answered at startup
 }
 
 // dockerInfo is the outcome of the startup Docker probe. Agents are served
@@ -104,7 +116,11 @@ type Runner struct {
 type dockerInfo struct {
 	available bool
 	version   string
+	err       string // why the probe failed, for facts.agents.error
 }
+
+// maxProbeError caps the Docker probe error reported in facts.
+const maxProbeError = 300
 
 // New validates opts and returns a Runner.
 func New(opts Options) (*Runner, error) {
@@ -178,6 +194,16 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Self-update needs the root-owned helper and its sudo rule (install.sh).
+	// Without them (containers, older installs) the runner just does not
+	// offer "update".
+	updater := updatex.New(updatex.Options{
+		Helper: opts.UpdateHelper, Current: version.Version, Exec: opts.UpdateExec, Logger: opts.Logger,
+	})
+	updates := updater.Available(context.Background())
+	if updates {
+		opts.Logger.Printf("updates from Routini are enabled")
+	}
 	return &Runner{
 		opts:   opts,
 		cfg:    cfg,
@@ -191,8 +217,10 @@ func New(opts Options) (*Runner, error) {
 		ptys: ptyx.NewManager(ptyx.Options{
 			Enabled: cfg.Capabilities.Pty, HangupGrace: opts.HangupGrace, Logger: opts.Logger,
 		}),
-		agents: agents,
-		docker: docker,
+		agents:  agents,
+		docker:  docker,
+		updater: updater,
+		updates: updates,
 	}, nil
 }
 
@@ -204,13 +232,17 @@ func probeDocker(cfg *config.Config, injected dockerx.Docker, logger *log.Logger
 	if !cfg.Capabilities.Agents {
 		return dockerInfo{}, nil
 	}
-	client, version, err := dialDocker(cfg, injected)
+	client, ver, err := dialDocker(cfg, injected)
 	if err != nil {
 		logger.Printf("agents are enabled in the config but Docker is unavailable: %v", err)
-		return dockerInfo{}, nil
+		msg := err.Error()
+		if len(msg) > maxProbeError {
+			msg = msg[:maxProbeError]
+		}
+		return dockerInfo{err: strings.ToValidUTF8(msg, "�")}, nil
 	}
-	logger.Printf("agents enabled: docker %s, up to %d running at a time", version, cfg.MaxConcurrentAgents)
-	return dockerInfo{available: true, version: version}, client
+	logger.Printf("agents enabled: docker %s, up to %d running at a time", ver, cfg.MaxConcurrentAgents)
+	return dockerInfo{available: true, version: ver}, client
 }
 
 // dialDocker takes the injected client or builds one from the config, then
@@ -366,6 +398,9 @@ func (r *Runner) capabilities() []string {
 	if r.cfg.Capabilities.Agents && r.docker.available {
 		caps = append(caps, "agents")
 	}
+	if r.updates {
+		caps = append(caps, "update")
+	}
 	return caps
 }
 
@@ -380,6 +415,10 @@ func (r *Runner) hostFacts() facts.Facts {
 			AgentsRunning: r.agents.Running(),
 			MaxAgents:     r.cfg.MaxConcurrentAgents,
 		}
+	}
+	f.Agents = &facts.Agents{Configured: r.cfg.Capabilities.Agents}
+	if r.cfg.Capabilities.Agents && !r.docker.available {
+		f.Agents.Error = r.docker.err
 	}
 	return f
 }
@@ -627,6 +666,16 @@ func (r *Runner) dispatch(st *dispatchState, data []byte) error {
 		r.agents.Start(m, st.send)
 	case "agent.cancel":
 		r.agents.Cancel(env.ID)
+	case "runner.update":
+		var m updatex.Msg
+		if err := json.Unmarshal(data, &m); err != nil {
+			r.log.Printf("ignoring malformed runner.update: %v", err)
+			if env.ID != "" {
+				st.send(updatex.ResultMsg{Type: "runner.update.result", ID: env.ID, Error: ptr("invalid runner.update message")})
+			}
+			return nil
+		}
+		r.updater.Start(r.updates, m, st.send)
 	case "pty.open":
 		var m ptyx.OpenMsg
 		if err := json.Unmarshal(data, &m); err != nil {

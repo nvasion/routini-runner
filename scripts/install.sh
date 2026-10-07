@@ -10,11 +10,17 @@
 # --enable-agents opts this host into running Routini agents in local Docker
 # containers. See the "Running agents on this server" section of README.md:
 # it puts the runner's user in the docker group, which is root-equivalent.
+#
+# The release's update helper is installed as /usr/local/sbin/routini-runner-update
+# with a sudoers rule, so Routini's "Update runner" button works. Pass
+# --no-remote-update to leave updates to this script.
 set -eu
 
 REPO="nvasion/routini-runner"
 BIN_DIR="/usr/local/bin"
 BIN="$BIN_DIR/routini-runner"
+UPDATER="/usr/local/sbin/routini-runner-update"
+SUDOERS="/etc/sudoers.d/routini-runner"
 RUNNER_USER="routini-runner"
 RUNNER_HOME="/var/lib/routini-runner"
 CONFIG_DIR="/etc/routini-runner"
@@ -30,6 +36,7 @@ TOKEN=""
 NAME=""
 VERSION=""
 ENABLE_AGENTS=0
+REMOTE_UPDATE=1
 
 say() { printf 'routini-runner install: %s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
@@ -39,7 +46,7 @@ shquote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 usage() {
 	cat >&2 <<EOF
 Usage: install.sh --url URL --token rre_... [--name NAME] [--version vX.Y.Z]
-                  [--enable-agents]
+                  [--enable-agents] [--no-remote-update]
 
   --url            Routini base URL (https://..., or http:// on a private network)
   --token          single-use enrollment token from the Routini console
@@ -49,6 +56,8 @@ Usage: install.sh --url URL --token rre_... [--name NAME] [--version vX.Y.Z]
                    capabilities.agents in the config and adds the
                    $RUNNER_USER user to the $DOCKER_GROUP group, which is
                    ROOT-EQUIVALENT on this host
+  --no-remote-update  do not let Routini update this runner (no sudoers
+                   rule for $UPDATER); upgrade by re-running this script
 
 --url and --token are only needed for the first install; later runs upgrade
 the binary and keep the existing enrollment.
@@ -193,6 +202,20 @@ warn_docker_group() {
 	say "         hand over to Routini agents; prefer a dedicated VM."
 }
 
+# sudoers_rule prints the sudoers file that lets the runner's user run the
+# update helper. The helper itself only honours --check and vX.Y.Z from that
+# user, so the "v[0-9]*" pattern cannot be widened by extra arguments.
+sudoers_rule() {
+	cat <<EOF
+# Installed by routini-runner's install.sh: lets Routini update this runner
+# (its "Update runner" button). $UPDATER accepts only
+# --check or a release tag vX.Y.Z from $RUNNER_USER and verifies the release's
+# sha256. Remove this file (or re-run install.sh --no-remote-update) to opt out.
+Defaults!$UPDATER !requiretty
+$RUNNER_USER ALL=(root) NOPASSWD: $UPDATER --check, $UPDATER v[0-9]*
+EOF
+}
+
 # When ROUTINI_INSTALL_SH_LIB is set, install.sh only defines the helpers above
 # and changes nothing on the host. scripts/install_test.sh uses this.
 if [ -n "${ROUTINI_INSTALL_SH_LIB:-}" ]; then
@@ -210,6 +233,7 @@ while [ $# -gt 0 ]; do
 	--version) need_value "$@"; VERSION="$2"; shift 2 ;;
 	--version=*) VERSION="${1#*=}"; shift ;;
 	--enable-agents) ENABLE_AGENTS=1; shift ;;
+	--no-remote-update) REMOTE_UPDATE=0; shift ;;
 	-h | --help) usage ;;
 	*) say "unknown argument: $1"; usage ;;
 	esac
@@ -284,6 +308,16 @@ mkdir -p "$BIN_DIR"
 install -m 0755 "$TMP/routini-runner" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 say "installed $("$BIN" version) to $BIN"
+
+# 3b. Update helper (releases from v0.3.0 on carry it).
+HAVE_UPDATER=0
+if tar -xzf "$TMP/$TARBALL" -C "$TMP" routini-runner-update 2>/dev/null; then
+	mkdir -p "$(dirname "$UPDATER")"
+	install -m 0755 -o root -g root "$TMP/routini-runner-update" "$UPDATER.new"
+	mv -f "$UPDATER.new" "$UPDATER"
+	HAVE_UPDATER=1
+	say "installed the update helper to $UPDATER"
+fi
 
 # 4. System user.
 if ! id "$RUNNER_USER" >/dev/null 2>&1; then
@@ -363,6 +397,26 @@ WantedBy=multi-user.target
 EOF
 chmod 0644 "$UNIT"
 
+# 7. Updates from Routini: a sudoers rule for the update helper.
+if [ "$REMOTE_UPDATE" -eq 0 ]; then
+	rm -f "$SUDOERS"
+	say "updates from Routini are off (--no-remote-update); upgrade by re-running this script"
+elif [ "$HAVE_UPDATER" -eq 0 ]; then
+	say "this release has no update helper; updates from Routini need v0.3.0 or newer"
+elif ! command -v sudo >/dev/null 2>&1 || [ ! -d /etc/sudoers.d ]; then
+	say "warning: sudo (with /etc/sudoers.d) is not installed, so Routini cannot update this runner"
+else
+	sudoers_rule >"$SUDOERS.new"
+	chmod 0440 "$SUDOERS.new"
+	if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$SUDOERS.new" >/dev/null 2>&1; then
+		rm -f "$SUDOERS.new"
+		say "warning: the sudoers rule did not validate; Routini cannot update this runner"
+	else
+		mv -f "$SUDOERS.new" "$SUDOERS"
+		say "Routini can update this runner (rule in $SUDOERS)"
+	fi
+fi
+
 systemctl daemon-reload
 if systemctl is-active --quiet routini-runner; then
 	systemctl enable routini-runner >/dev/null 2>&1 || true
@@ -375,10 +429,12 @@ fi
 say "done. Logs: journalctl -u routini-runner -f"
 say "to let Routini run privileged commands, add sudo rules for the '$RUNNER_USER' user yourself"
 if [ "$ENABLE_AGENTS" -eq 1 ]; then
-	say "agents are enabled on this host. To switch them off again, set"
-	say "\"agents\": false under \"capabilities\" in $CONFIG, run"
-	say "'gpasswd -d $RUNNER_USER $DOCKER_GROUP' and restart the service."
+	say "agents are enabled on this host. To switch them off again, run"
+	say "'sudo $UPDATER --disable-agents' (or set \"agents\": false under"
+	say "\"capabilities\" in $CONFIG, run 'gpasswd -d $RUNNER_USER $DOCKER_GROUP'"
+	say "and restart the service)."
 else
-	say "agents are not enabled. Re-run with --enable-agents to allow them"
-	say "(see \"Running agents on this server\" in the README)."
+	say "agents are not enabled. To allow them, run 'sudo $UPDATER --enable-agents'"
+	say "or re-run this script with --enable-agents (see \"Running agents on this"
+	say "server\" in the README)."
 fi
