@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -35,6 +36,16 @@ type fakeAPI struct {
 	containerStop    func(ctx context.Context, id string, opts container.StopOptions) error
 	containerKill    func(ctx context.Context, id, signal string) error
 	containerRemove  func(ctx context.Context, id string, opts container.RemoveOptions) error
+
+	containerExecCreate  func(ctx context.Context, id string, opts container.ExecOptions) (types.IDResponse, error)
+	containerExecStart   func(ctx context.Context, execID string, cfg container.ExecStartOptions) error
+	containerExecAttach  func(ctx context.Context, execID string, cfg container.ExecAttachOptions) (types.HijackedResponse, error)
+	containerExecInspect func(ctx context.Context, execID string) (container.ExecInspect, error)
+	containerExecResize  func(ctx context.Context, execID string, opts container.ResizeOptions) error
+
+	volumeInspect func(ctx context.Context, id string) (volume.Volume, error)
+	volumeCreate  func(ctx context.Context, opts volume.CreateOptions) (volume.Volume, error)
+	volumeRemove  func(ctx context.Context, id string, force bool) error
 
 	mu    sync.Mutex
 	calls []string
@@ -189,6 +200,70 @@ func (f *fakeAPI) ContainerRemove(ctx context.Context, id string, opts container
 		return unexpected("ContainerRemove")
 	}
 	return f.containerRemove(ctx, id, opts)
+}
+
+func (f *fakeAPI) ContainerExecCreate(ctx context.Context, id string, opts container.ExecOptions) (types.IDResponse, error) {
+	f.record("ContainerExecCreate(%s)", id)
+	if f.containerExecCreate == nil {
+		return types.IDResponse{}, unexpected("ContainerExecCreate")
+	}
+	return f.containerExecCreate(ctx, id, opts)
+}
+
+func (f *fakeAPI) ContainerExecStart(ctx context.Context, execID string, cfg container.ExecStartOptions) error {
+	f.record("ContainerExecStart(%s)", execID)
+	if f.containerExecStart == nil {
+		return unexpected("ContainerExecStart")
+	}
+	return f.containerExecStart(ctx, execID, cfg)
+}
+
+func (f *fakeAPI) ContainerExecAttach(ctx context.Context, execID string, cfg container.ExecAttachOptions) (types.HijackedResponse, error) {
+	f.record("ContainerExecAttach(%s)", execID)
+	if f.containerExecAttach == nil {
+		return types.HijackedResponse{}, unexpected("ContainerExecAttach")
+	}
+	return f.containerExecAttach(ctx, execID, cfg)
+}
+
+func (f *fakeAPI) ContainerExecInspect(ctx context.Context, execID string) (container.ExecInspect, error) {
+	f.record("ContainerExecInspect(%s)", execID)
+	if f.containerExecInspect == nil {
+		return container.ExecInspect{}, unexpected("ContainerExecInspect")
+	}
+	return f.containerExecInspect(ctx, execID)
+}
+
+func (f *fakeAPI) ContainerExecResize(ctx context.Context, execID string, opts container.ResizeOptions) error {
+	f.record("ContainerExecResize(%s)", execID)
+	if f.containerExecResize == nil {
+		return unexpected("ContainerExecResize")
+	}
+	return f.containerExecResize(ctx, execID, opts)
+}
+
+func (f *fakeAPI) VolumeInspect(ctx context.Context, id string) (volume.Volume, error) {
+	f.record("VolumeInspect(%s)", id)
+	if f.volumeInspect == nil {
+		return volume.Volume{}, unexpected("VolumeInspect")
+	}
+	return f.volumeInspect(ctx, id)
+}
+
+func (f *fakeAPI) VolumeCreate(ctx context.Context, opts volume.CreateOptions) (volume.Volume, error) {
+	f.record("VolumeCreate(%s)", opts.Name)
+	if f.volumeCreate == nil {
+		return volume.Volume{}, unexpected("VolumeCreate")
+	}
+	return f.volumeCreate(ctx, opts)
+}
+
+func (f *fakeAPI) VolumeRemove(ctx context.Context, id string, force bool) error {
+	f.record("VolumeRemove(%s,force=%t)", id, force)
+	if f.volumeRemove == nil {
+		return unexpected("VolumeRemove")
+	}
+	return f.volumeRemove(ctx, id, force)
 }
 
 // noopStart and noopRemove succeed without recording anything, for the calls

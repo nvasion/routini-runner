@@ -3,6 +3,7 @@ package agentx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -157,6 +158,46 @@ func (f *fakeDocker) KillByLabels(_ context.Context, labels map[string]string) e
 		return f.kill(labels)
 	}
 	return nil
+}
+
+func (f *fakeDocker) EnsureVolume(context.Context, string, map[string]string) error {
+	f.rec.add("EnsureVolume")
+	return nil
+}
+
+func (f *fakeDocker) RemoveVolume(context.Context, string) error {
+	f.rec.add("RemoveVolume")
+	return nil
+}
+
+func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string, error) {
+	f.rec.add("StartEnvContainer")
+	return "", errors.New("no environment container in this test")
+}
+
+func (f *fakeDocker) InspectEnv(context.Context, string) (dockerx.EnvInfo, error) {
+	f.rec.add("InspectEnv")
+	return dockerx.EnvInfo{}, nil
+}
+
+func (f *fakeDocker) RemoveEnvContainer(context.Context, string) error {
+	f.rec.add("RemoveEnvContainer")
+	return nil
+}
+
+func (f *fakeDocker) CountEnvContainers(context.Context) (int, error) {
+	f.rec.add("CountEnvContainers")
+	return 0, nil
+}
+
+func (f *fakeDocker) ExecStreaming(context.Context, string, dockerx.ExecSpec, func(string, string)) (*int, error) {
+	f.rec.add("ExecStreaming")
+	return nil, errors.New("no exec in this test")
+}
+
+func (f *fakeDocker) ExecTTY(context.Context, string, uint, uint) (dockerx.TTY, error) {
+	f.rec.add("ExecTTY")
+	return nil, errors.New("no tty in this test")
 }
 
 func (f *fakeDocker) lastSpec(t *testing.T) dockerx.RunSpec {

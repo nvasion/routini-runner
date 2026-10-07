@@ -106,6 +106,46 @@ func (f *fakeDocker) KillByLabels(context.Context, map[string]string) error {
 	return nil
 }
 
+func (f *fakeDocker) EnsureVolume(context.Context, string, map[string]string) error {
+	f.record("EnsureVolume")
+	return nil
+}
+
+func (f *fakeDocker) RemoveVolume(context.Context, string) error {
+	f.record("RemoveVolume")
+	return nil
+}
+
+func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string, error) {
+	f.record("StartEnvContainer")
+	return "", errors.New("no environment container in this test")
+}
+
+func (f *fakeDocker) InspectEnv(context.Context, string) (dockerx.EnvInfo, error) {
+	f.record("InspectEnv")
+	return dockerx.EnvInfo{}, nil
+}
+
+func (f *fakeDocker) RemoveEnvContainer(context.Context, string) error {
+	f.record("RemoveEnvContainer")
+	return nil
+}
+
+func (f *fakeDocker) CountEnvContainers(context.Context) (int, error) {
+	f.record("CountEnvContainers")
+	return 0, nil
+}
+
+func (f *fakeDocker) ExecStreaming(context.Context, string, dockerx.ExecSpec, func(string, string)) (*int, error) {
+	f.record("ExecStreaming")
+	return nil, errors.New("no exec in this test")
+}
+
+func (f *fakeDocker) ExecTTY(context.Context, string, uint, uint) (dockerx.TTY, error) {
+	f.record("ExecTTY")
+	return nil, errors.New("no tty in this test")
+}
+
 // withAgents enables agents and injects the fake daemon.
 func withAgents(d *fakeDocker) func(*config.Config, *conn.Options) {
 	return func(cfg *config.Config, opts *conn.Options) {

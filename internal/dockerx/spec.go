@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/strslice"
 )
 
@@ -35,6 +36,10 @@ var (
 	// refRe matches an image reference: registry, repository, tag and digest
 	// characters only, so no shell or URL metacharacters can slip through.
 	refRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.:/@-]*$`)
+	// envNameRe matches an environment container or volume name.
+	envNameRe = regexp.MustCompile(`^routini-env-[a-z0-9-]{1,80}$`)
+	// envNetworkRe matches an environment's sandbox network name.
+	envNetworkRe = regexp.MustCompile(`^routini-sb-[A-Za-z0-9-]{1,80}$`)
 )
 
 // validate checks every field that is interpolated into an Engine API request
@@ -77,11 +82,18 @@ func (s RunSpec) validate() error {
 }
 
 func validateName(kind, name string) error {
-	if name == "" {
+	return validatePattern(kind, name, nameRe)
+}
+
+// validatePattern checks that value is non-empty and matches re, naming the
+// field in both error cases without echoing values that might be secrets
+// (callers only use this for names, never for env or label values).
+func validatePattern(kind, value string, re *regexp.Regexp) error {
+	if value == "" {
 		return fmt.Errorf("dockerx: %s is missing", kind)
 	}
-	if !nameRe.MatchString(name) {
-		return fmt.Errorf("dockerx: invalid %s %q", kind, name)
+	if !re.MatchString(value) {
+		return fmt.Errorf("dockerx: invalid %s %q", kind, value)
 	}
 	return nil
 }
@@ -129,6 +141,59 @@ func validateLabels(labels map[string]string) error {
 	return nil
 }
 
+// validateEnvLabels applies validateLabels and then requires the two labels
+// every environment container and volume must carry: without them,
+// RemoveVolume, RemoveEnvContainer and CountEnvContainers could not tell a
+// Routini environment apart from an unrelated object on the same host.
+func validateEnvLabels(labels map[string]string) error {
+	if err := validateLabels(labels); err != nil {
+		return err
+	}
+	if labels[LabelManaged] != "true" {
+		return fmt.Errorf("dockerx: labels must include %s=true", LabelManaged)
+	}
+	if labels[LabelEnvironment] == "" {
+		return fmt.Errorf("dockerx: labels must include a non-empty %s", LabelEnvironment)
+	}
+	return nil
+}
+
+// validate checks every field of an EnvSpec before it reaches the Engine
+// API, the same way RunSpec.validate does.
+func (s EnvSpec) validate() error {
+	if err := validatePattern("environment name", s.Name, envNameRe); err != nil {
+		return err
+	}
+	if err := validatePattern("volume name", s.Volume, envNameRe); err != nil {
+		return err
+	}
+	if err := validatePattern("network name", s.Network, envNetworkRe); err != nil {
+		return err
+	}
+	if err := validateRef(s.Image); err != nil {
+		return err
+	}
+	if s.Runtime != "" && !runtimeRe.MatchString(s.Runtime) {
+		return fmt.Errorf("dockerx: invalid runtime %q", s.Runtime)
+	}
+	if err := validateEnv(s.Env); err != nil {
+		return err
+	}
+	if err := validateEnvLabels(s.Labels); err != nil {
+		return err
+	}
+	if s.Cpus < 0 {
+		return fmt.Errorf("dockerx: cpus must not be negative (got %v)", s.Cpus)
+	}
+	if s.MemoryMb < 0 {
+		return fmt.Errorf("dockerx: memoryMb must not be negative (got %d)", s.MemoryMb)
+	}
+	if s.PidsLimit < 0 {
+		return fmt.Errorf("dockerx: pidsLimit must not be negative (got %d)", s.PidsLimit)
+	}
+	return nil
+}
+
 // containerConfig maps a validated RunSpec onto the Engine API's create
 // payload. It is pure: every hardening default lives here and nowhere else.
 func containerConfig(spec RunSpec) (*container.Config, *container.HostConfig) {
@@ -154,6 +219,48 @@ func containerConfig(spec RunSpec) (*container.Config, *container.HostConfig) {
 		SecurityOpt: []string{"no-new-privileges:true"},
 		Runtime:     spec.Runtime,
 		AutoRemove:  false,
+		Resources: container.Resources{
+			Memory:    spec.MemoryMb * bytesPerMiB,
+			NanoCPUs:  int64(spec.Cpus * nanoCPUsPerCPU),
+			PidsLimit: &pids,
+		},
+	}
+	return cfg, host
+}
+
+// envContainerConfig maps a validated EnvSpec onto the Engine API's create
+// payload. It is pure: every hardening default lives here and nowhere else.
+// Unlike containerConfig, the container never runs the workload directly;
+// it just idles under tail -f /dev/null so ExecStreaming and ExecTTY can run
+// commands inside it on demand.
+func envContainerConfig(spec EnvSpec) (*container.Config, *container.HostConfig) {
+	pids := spec.PidsLimit
+	if pids == 0 {
+		pids = DefaultPidsLimit
+	}
+	init := true
+	cfg := &container.Config{
+		Image:      spec.Image,
+		User:       DefaultUser,
+		Entrypoint: strslice.StrSlice{"tail", "-f", "/dev/null"},
+		Cmd:        strslice.StrSlice{},
+		WorkingDir: workspaceDir,
+		Labels:     copyLabels(spec.Labels),
+		Env:        envSlice(spec.Env),
+	}
+	host := &container.HostConfig{
+		Init: &init,
+		Mounts: []mount.Mount{{
+			Type:   mount.TypeVolume,
+			Source: spec.Volume,
+			Target: workspaceDir,
+		}},
+		CapDrop:       strslice.StrSlice{"ALL"},
+		SecurityOpt:   []string{"no-new-privileges:true"},
+		Runtime:       spec.Runtime,
+		NetworkMode:   container.NetworkMode(spec.Network),
+		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
+		AutoRemove:    false,
 		Resources: container.Resources{
 			Memory:    spec.MemoryMb * bytesPerMiB,
 			NanoCPUs:  int64(spec.Cpus * nanoCPUsPerCPU),
