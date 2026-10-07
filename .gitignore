@@ -4,3 +4,6 @@
 /.gotmp/
 *.test
 *.out
+
+# Local development environments (direnv)
+.envrc

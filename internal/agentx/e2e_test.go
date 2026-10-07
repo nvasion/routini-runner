@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
+	"github.com/nvasion/routini-runner/internal/egressctl"
 )
 
 // EnvE2E opts a test run into the end-to-end test below. It needs a reachable
@@ -150,9 +151,9 @@ func TestE2EAgainstRealDocker(t *testing.T) {
 		t.Errorf("egress = %+v, want %+v", exit.Egress, want)
 	}
 	if got := rec.list(); !reflect.DeepEqual(got, []string{
-		"PUT " + sessionsPath + testToken,
-		"GET " + caPath,
-		"DELETE " + sessionsPath + testToken,
+		"PUT " + egressctl.SessionsPath + testToken,
+		"GET " + egressctl.CAPath,
+		"DELETE " + egressctl.SessionsPath + testToken,
 	}) {
 		t.Errorf("control calls = %v", got)
 	}

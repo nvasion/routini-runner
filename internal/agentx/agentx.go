@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
+	"github.com/nvasion/routini-runner/internal/egressctl"
 	"github.com/nvasion/routini-runner/internal/enroll"
 )
 
@@ -183,11 +184,7 @@ type OutputMsg struct {
 
 // EgressStats are the session counters the egress proxy reports when the
 // session is closed.
-type EgressStats struct {
-	Requests    int      `json:"requests"`
-	Intercepted int      `json:"intercepted"`
-	Blocked     []string `json:"blocked"`
-}
+type EgressStats = egressctl.Stats
 
 // ExitMsg is the agent.exit message. Exactly one is sent per agent.start.
 type ExitMsg struct {
@@ -226,6 +223,13 @@ type Options struct {
 	// Runtime is the OCI runtime for agent containers; "" means Docker's
 	// default.
 	Runtime string
+	// EgressSecret is shared with the egress container and authenticates
+	// every control API call. It is the same secret internal/conn passes to
+	// envx, so EnsureEgress never sees the two packages disagree about it and
+	// recreate routini-egress out from under one another. Empty means a
+	// Manager generates its own, for callers (and tests) that do not share
+	// one across packages.
+	EgressSecret string
 	// HTTPClient talks to the egress control API; nil means a loopback
 	// client with a timeout and no redirects.
 	HTTPClient *http.Client
@@ -256,11 +260,15 @@ func New(opts Options) (*Manager, error) {
 		opts.Logger = log.New(io.Discard, "", 0)
 	}
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = defaultHTTPClient()
+		opts.HTTPClient = egressctl.DefaultHTTPClient()
 	}
-	secret, err := newSecret()
-	if err != nil {
-		return nil, err
+	secret := opts.EgressSecret
+	if secret == "" {
+		s, err := newSecret()
+		if err != nil {
+			return nil, err
+		}
+		secret = s
 	}
 	return &Manager{
 		opts: opts,
@@ -517,17 +525,17 @@ func (m *Manager) lifecycle(ctx context.Context, j *job, msg StartMsg) (code *in
 
 	// Step 3: the egress session. From here on step 7 always closes it, so
 	// the real credentials never outlive the task inside the proxy.
-	ctrl, err := newControl(controlURL, m.secret, m.opts.HTTPClient)
+	ctrl, err := egressctl.New(controlURL, m.secret, m.opts.HTTPClient)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := ctrl.openSession(ctx, eg.Token, eg.Session); err != nil {
+	if err := ctrl.OpenSession(ctx, eg.Token, eg.Session); err != nil {
 		return nil, nil, err
 	}
 	defer func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer ccancel()
-		s, cerr := ctrl.closeSession(cctx, eg.Token)
+		s, cerr := ctrl.CloseSession(cctx, eg.Token)
 		if cerr != nil {
 			// agent.exit.egress stays null; the task's own outcome is what
 			// gets reported.
@@ -536,7 +544,7 @@ func (m *Manager) lifecycle(ctx context.Context, j *job, msg StartMsg) (code *in
 		}
 		stats = s
 	}()
-	pem, err := ctrl.certificateAuthority(ctx)
+	pem, err := ctrl.CA(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

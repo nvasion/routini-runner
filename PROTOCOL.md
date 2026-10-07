@@ -44,18 +44,19 @@ The runner writes its config file at mode 0600, creating the parent directory at
 ```json
 { "url": "https://routini.example.com", "runnerId": "uuid", "credential": "rrc_xxx", "caFile": null,
   "capabilities": { "exec": true, "pty": true, "agents": false },
-  "maxConcurrentExec": 8, "maxConcurrentAgents": 2,
+  "maxConcurrentExec": 8, "maxConcurrentAgents": 2, "maxEnvironments": 4,
   "agentImagePrefixes": ["ghcr.io/nvasion/"], "dockerHost": "", "containerRuntime": "" }
 ```
 
 Admins can edit `capabilities` and the limits by hand. For example, `"pty": false` turns off interactive terminals on that server.
 
-`capabilities.agents` enables containerised agent tasks (section 2.6). Enrollment writes it as **false**, because it needs access to the local Docker daemon. Setting it to `true` is not enough on its own: the runner advertises `agents` only when **both** `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup. If the ping fails, the runner starts normally, does not advertise `agents`, and refuses `agent.start`.
+`capabilities.agents` enables containerised agent tasks (section 2.6) **and** environments (section 2.8): environments come bundled with the agents opt-in and do not have a config flag of their own. Enrollment writes it as **false**, because it needs access to the local Docker daemon. Setting it to `true` is not enough on its own: the runner advertises `agents` and `environments` only when **both** `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup. If the ping fails, the runner starts normally, does not advertise either capability, and refuses `agent.start` and `env.op`.
 
 Optional keys that only matter once `capabilities.agents` is true:
 
-- `agentImagePrefixes`: the image allow-list, the image references the runner is willing to run. Missing or empty means `["ghcr.io/nvasion/"]`. The runner refuses `agent.start` for any agent or egress image that does not start with one of these prefixes.
+- `agentImagePrefixes`: the image allow-list, the image references the runner is willing to run. Missing or empty means `["ghcr.io/nvasion/"]`. The runner refuses `agent.start` for any agent or egress image that does not start with one of these prefixes, and refuses an environment `container.start` or `pull` the same way.
 - `maxConcurrentAgents`: caps parallel agent containers. Missing or not positive means the default, 2.
+- `maxEnvironments`: caps parallel environment containers. Missing or not positive means the default, 4.
 - `dockerHost`: the Docker endpoint. Default `""`, meaning `unix:///var/run/docker.sock`. The `DOCKER_HOST` environment variable overrides it.
 - `containerRuntime`: default `""`, meaning Docker's default runtime. `"runsc"` selects gVisor.
 
@@ -87,10 +88,10 @@ The runner sends `hello` immediately after the connection opens:
 
 ```json
 { "type": "hello", "protocol": 1, "version": "0.3.0", "hostname": "web-01.prod", "os": "linux", "arch": "amd64",
-  "capabilities": ["exec", "pty", "agents", "update"], "facts": { ...see 2.2 } }
+  "capabilities": ["exec", "pty", "agents", "environments", "update"], "facts": { ...see 2.2 } }
 ```
 
-`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. `"update"` appears when the root-owned update helper is installed and `sudo -n routini-runner-update --check` answered `ok` at startup (section 2.7). A server must not send the frames of a feature it was not offered.
+`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` and `"environments"` appear only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup, and always together; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. `"update"` appears when the root-owned update helper is installed and `sudo -n routini-runner-update --check` answered `ok` at startup (section 2.7). A server must not send the frames of a feature it was not offered.
 
 The server replies with `welcome`:
 
@@ -114,7 +115,7 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
   "memTotalMb": 7972, "memUsedPct": 41,
   "diskTotalGb": 78.6, "diskUsedPct": 63,
   "addresses": ["10.0.0.11", "fd00::11"],
-  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2 },
+  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2, "environmentsRunning": 0, "maxEnvironments": 4 },
   "agents": { "configured": true }
 }
 ```
@@ -122,7 +123,7 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
 - `memUsedPct` is `(MemTotal - MemAvailable) / MemTotal`.
 - `diskUsedPct` covers `/` and excludes reserved blocks: `(total - free) / (total - free + avail)`, which is the same as `df`.
 - `addresses` lists non-loopback interface addresses.
-- `docker` reports the local Docker daemon: `available` says whether it answered at the last probe and `version` is what its ping returned. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. The whole object is omitted when Docker is unreachable; an older runner omits it too, which is why the protocol version stays 1.
+- `docker` reports the local Docker daemon: `available` says whether it answered at the last probe and `version` is what its ping returned. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. `environmentsRunning` and `maxEnvironments` report the same for environment containers (section 2.8). The whole object is omitted when Docker is unreachable; an older runner omits it too, which is why the protocol version stays 1.
 - `agents` says why agents are or are not served, so a console can tell an admin what to do on the host. `configured` is `capabilities.agents` in `config.json`. When it is `true` but Docker did not answer the startup ping, `error` holds the reason (at most 300 bytes, e.g. a permission error on the Docker socket). Runners before 0.3.0 omit the object.
 
 ### 2.3 Exec: run a command
@@ -324,6 +325,87 @@ The runner answers with exactly one result:
 - After `ok: true` the service restarts within a few seconds. The runner then reconnects and its `hello` carries the new `version`, which is how the server confirms the update took effect.
 
 Switching agents on or off is **not** possible through this channel: it changes membership of the `docker` group, which is root-equivalent, so the helper only does it for root on the host (`sudo routini-runner-update --enable-agents`).
+
+### 2.8 Environments
+
+An environment is a long-lived container a user works in interactively (shell, file edits, exec), as opposed to the one-shot, unattended agent tasks of section 2.6. It shares the egress design: an environment container has no route to the internet except through `routini-egress`, the same local proxy agents use.
+
+These frames exist only for a runner that advertised the `environments` capability in `hello` (section 2.1), which — like `agents` — needs `capabilities.agents: true` **and** a Docker daemon that answered the startup ping. They are additive and gated by that capability, so the protocol version stays **1**.
+
+The server sends operations and gets exactly one result each:
+
+```json
+{ "type": "env.op", "id": "op-uuid", "op": "container.start", "args": { ... } }
+{ "type": "env.cancel", "id": "op-uuid" }
+```
+
+`env.cancel` only has an effect on a running `exec` op; it kills the process tree the same way a timeout does (see `exec` below).
+
+The runner streams output for `exec` ops with exactly the framing of `exec.output` (2.3): one frame per line, split on `\n`, a trailing `\r` stripped, invalid UTF-8 replaced with U+FFFD, lines longer than 16 KiB split into 16 KiB pieces, and an unterminated final line flushed at exit.
+
+```json
+{ "type": "env.output", "id": "op-uuid", "stream": "stdout", "data": "one line" }
+```
+
+Every `env.op` is answered by exactly one `env.done`:
+
+```json
+{ "type": "env.done", "id": "op-uuid", "ok": true, "error": null, "exitCode": null, "timedOut": false, "canceled": false, "result": { ... } }
+```
+
+- `ok` is `true` whenever the operation itself ran, regardless of the result it produced (for `exec`, that means `ok` is `true` for a non-zero exit code too; it is `false` only when the command could not be run at all).
+- `error` is a short message when the op was refused or failed, otherwise `null`.
+- `exitCode`, `timedOut` and `canceled` only apply to `exec`; they are `null`/`false` for every other op.
+- `result` is the op's own result payload (below), or `null` when it has none.
+
+**Ops:**
+
+| op | args | result | notes |
+| --- | --- | --- | --- |
+| `volume.ensure` | `{name, labels}` | `null` | creates the volume if it does not exist |
+| `volume.remove` | `{name}` | `null` | managed volumes only; a missing volume is fine |
+| `network.ensure` | `{network, egressImage}` | `{network}` | `egressImage` must be allow-listed; ensures the `routini-egress` container, the internal network `network`, and connects `routini-egress` to it with the alias `routini-egress` (as in section 2.6 step 2) |
+| `session.open` | `{session}` | `{caPem}` | `PUT`s `session` on `routini-egress`'s local control port, then `GET /ca` (as in section 2.6 step 3) |
+| `session.close` | `{token}` | `{egress}` | `DELETE`s the session; `egress` holds its stats, or `null` when they could not be read |
+| `container.start` | `{name, image, volume, labels, cpus, memoryMb, pidsLimit, network, env}` | `{containerId}` | starts an environment container; see refusals and rules below |
+| `container.remove` | `{containerId}` | `null` | force-removes the container |
+| `container.state` | `{containerId}` | `{state}` | `state` is `"running"`, `"stopped"` or `"missing"`; a container that is not a managed environment container reports `"missing"` |
+| `exec` | `{containerId, cmd, env, workdir, timeoutSec}` | `null` | runs `cmd` inside the container, streaming `env.output` as above |
+| `pull` | `{image}` | `null` | `image` must be allow-listed |
+
+`container.start` refusals (reported in `env.done.error`, nothing created):
+
+- `"image not allowed by agentImagePrefixes: <ref>"`, when `image` does not start with one of `agentImagePrefixes`.
+- `"runner busy (N environments running)"`, where `N` is the number already running, once `maxEnvironments` is reached.
+
+For `exec`: a timeout or an `env.cancel` kills the process tree the same way exec tasks do (section 2.3: SIGTERM to the group, SIGKILL after the grace period). `exitCode` is `null` when the process was killed. `ok` is `true` whenever the command ran at all, whatever its own exit code — a non-zero exit is not a protocol failure.
+
+**Rules:**
+
+- The runner only touches containers and volumes carrying **both** labels `routini.managed=true` and `routini.environment`; any other object is left alone (and `container.state`/`container.remove`/`volume.remove` treat it as missing or refuse it).
+- Environment containers run as `1000:1000`, with `CapDrop: ["ALL"]`, `no-new-privileges`, a PIDs limit, CPU and memory limits, the named volume mounted at `/workspace` only, and a `routini-sb-*` network — the same sandboxing agent containers get, but long-lived.
+- **If the control connection drops,** the runner cancels running environment `exec` ops, closes environment terminals (below), and closes every egress session it opened through `session.open` — for the same reason agent sessions are closed (section 2.6): the real credentials must not sit in the proxy's memory unsupervised. Unlike agents, **environment containers and volumes are left running**: they are long-lived state, and the server reopens their egress session (`session.open` again) on the next connection instead of recreating the container.
+- `session.open`'s `session` and `exec`'s `env` carry secrets exactly like `agent.start`'s `egress.session` and `env` (section 2.6): they arrive only inside `env.op` over the existing TLS WebSocket, and are never written to disk or logged.
+
+**Terminal.** An interactive shell inside a running environment container:
+
+```json
+{ "type": "env.tty.open", "id": "term-uuid", "containerId": "...", "cols": 120, "rows": 32 }
+```
+
+Answered by one of:
+
+```json
+{ "type": "env.tty.opened", "id": "term-uuid" }
+{ "type": "env.tty.error", "id": "term-uuid", "message": "..." }
+```
+
+The runner starts `bash -l` as `1000:1000` in `/workspace`. Data uses base64, exactly as PTY sessions do (section 2.4):
+
+- Runner to server: `{ "type": "env.tty.data", "id": "...", "b64": "..." }`
+- Server to runner: `{ "type": "env.tty.input", "id": "...", "b64": "..." }`, `{ "type": "env.tty.resize", "id": "...", "cols": 100, "rows": 30 }`, `{ "type": "env.tty.close", "id": "..." }`
+
+When the shell exits for any reason, the runner sends `{ "type": "env.tty.exit", "id": "term-uuid", "exitCode": 0 }`, which ends the session; frames for that id after this point are ignored. Each runner allows at most 4 open environment terminals, independent of the 4-terminal PTY limit in section 2.4.
 
 ## 3. Versioning
 

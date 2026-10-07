@@ -60,6 +60,12 @@ type Docker struct {
 	// MaxAgents is the configured maxConcurrentAgents, so a console can
 	// show spare capacity.
 	MaxAgents int `json:"maxAgents"`
+	// EnvironmentsRunning is the number of environment containers running
+	// now.
+	EnvironmentsRunning int `json:"environmentsRunning"`
+	// MaxEnvironments is the configured maxEnvironments, so a console can
+	// show spare capacity.
+	MaxEnvironments int `json:"maxEnvironments"`
 }
 
 func ptr[T any](v T) *T { return &v }

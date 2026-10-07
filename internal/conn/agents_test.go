@@ -35,6 +35,12 @@ type fakeDocker struct {
 	imageErr    error
 	hold        chan struct{} // non-nil: EnsureEgress waits for it
 
+	// Overrides used by the environment tests; nil keeps the stub default.
+	inspectEnv  func() (dockerx.EnvInfo, error)
+	execStream  func(ctx context.Context, onLine func(string, string)) (*int, error)
+	execTTYHook func(ctx context.Context) (dockerx.TTY, error)
+	countEnv    func() (int, error)
+
 	mu    sync.Mutex
 	calls []string
 }
@@ -106,6 +112,63 @@ func (f *fakeDocker) KillByLabels(context.Context, map[string]string) error {
 	return nil
 }
 
+func (f *fakeDocker) EnsureVolume(context.Context, string, map[string]string) error {
+	f.record("EnsureVolume")
+	return nil
+}
+
+func (f *fakeDocker) RemoveVolume(context.Context, string) error {
+	f.record("RemoveVolume")
+	return nil
+}
+
+func (f *fakeDocker) InspectVolume(context.Context, string) (dockerx.VolumeInfo, error) {
+	f.record("InspectVolume")
+	return dockerx.VolumeInfo{}, nil
+}
+
+func (f *fakeDocker) StartEnvContainer(context.Context, dockerx.EnvSpec) (string, error) {
+	f.record("StartEnvContainer")
+	return "", errors.New("no environment container in this test")
+}
+
+func (f *fakeDocker) InspectEnv(context.Context, string) (dockerx.EnvInfo, error) {
+	f.record("InspectEnv")
+	if f.inspectEnv != nil {
+		return f.inspectEnv()
+	}
+	return dockerx.EnvInfo{}, nil
+}
+
+func (f *fakeDocker) RemoveEnvContainer(context.Context, string) error {
+	f.record("RemoveEnvContainer")
+	return nil
+}
+
+func (f *fakeDocker) CountEnvContainers(context.Context) (int, error) {
+	f.record("CountEnvContainers")
+	if f.countEnv != nil {
+		return f.countEnv()
+	}
+	return 0, nil
+}
+
+func (f *fakeDocker) ExecStreaming(ctx context.Context, _ string, _ dockerx.ExecSpec, onLine func(string, string)) (*int, error) {
+	f.record("ExecStreaming")
+	if f.execStream != nil {
+		return f.execStream(ctx, onLine)
+	}
+	return nil, errors.New("no exec in this test")
+}
+
+func (f *fakeDocker) ExecTTY(ctx context.Context, _ string, _, _ uint) (dockerx.TTY, error) {
+	f.record("ExecTTY")
+	if f.execTTYHook != nil {
+		return f.execTTYHook(ctx)
+	}
+	return nil, errors.New("no tty in this test")
+}
+
 // withAgents enables agents and injects the fake daemon.
 func withAgents(d *fakeDocker) func(*config.Config, *conn.Options) {
 	return func(cfg *config.Config, opts *conn.Options) {
@@ -150,7 +213,7 @@ func TestHelloAdvertisesAgentsOnlyWhenDockerAnswers(t *testing.T) {
 		{
 			name:       "agents on and docker answers",
 			mutate:     withAgents(&fakeDocker{pingVersion: dockerVer}),
-			wantCaps:   []any{"exec", "pty", "agents"},
+			wantCaps:   []any{"exec", "pty", "agents", "environments"},
 			wantDocker: true,
 		},
 		{
@@ -189,6 +252,7 @@ func TestHelloAdvertisesAgentsOnlyWhenDockerAnswers(t *testing.T) {
 				want := map[string]any{
 					"available": true, "version": dockerVer,
 					"agentsRunning": float64(0), "maxAgents": float64(config.DefaultMaxConcurrentAgents),
+					"environmentsRunning": float64(0), "maxEnvironments": float64(config.DefaultMaxEnvironments),
 				}
 				if !reflect.DeepEqual(docker, want) {
 					t.Errorf("facts.docker = %v, want %v", docker, want)

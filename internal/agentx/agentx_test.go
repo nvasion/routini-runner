@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
+	"github.com/nvasion/routini-runner/internal/egressctl"
 )
 
 // wantOrder is the sequence of PROTOCOL.md 2.6 for one successful task.
@@ -20,11 +21,11 @@ var wantOrder = []string{
 	"EnsureEgress " + testEgressImage,
 	"EnsureNetwork " + testNetwork,
 	"ConnectNetwork " + testNetwork + " routini-egress routini-egress",
-	"PUT " + sessionsPath + testToken,
-	"GET " + caPath,
+	"PUT " + egressctl.SessionsPath + testToken,
+	"GET " + egressctl.CAPath,
 	"EnsureImage " + testAgentImage + " always",
 	"RunStreaming " + ContainerPrefix + testID,
-	"DELETE " + sessionsPath + testToken,
+	"DELETE " + egressctl.SessionsPath + testToken,
 }
 
 func TestStartRunsTheStepsInOrder(t *testing.T) {
@@ -368,7 +369,7 @@ func TestTimeoutStopsTheContainer(t *testing.T) {
 	if !f.rec.has("Stop " + ContainerPrefix + testID + " " + StopGrace.String()) {
 		t.Errorf("Stop was not called with a %s grace: %v", StopGrace, f.rec.list())
 	}
-	if !f.rec.has("DELETE " + sessionsPath + testToken) {
+	if !f.rec.has("DELETE " + egressctl.SessionsPath + testToken) {
 		t.Errorf("the session was not closed: %v", f.rec.list())
 	}
 }
@@ -623,7 +624,7 @@ func TestFailingStepStillClosesAnOpenSession(t *testing.T) {
 				strings.Contains(*exit.Error, f.mgr.secret) {
 				t.Errorf("error leaks a secret: %q", *exit.Error)
 			}
-			gotDelete := f.rec.has("DELETE " + sessionsPath + testToken)
+			gotDelete := f.rec.has("DELETE " + egressctl.SessionsPath + testToken)
 			if gotDelete != tc.wantDelete {
 				t.Errorf("session closed = %v, want %v; calls: %v", gotDelete, tc.wantDelete, f.rec.list())
 			}
@@ -653,7 +654,7 @@ func TestEgressIsNullWhenTheSessionCannotBeClosed(t *testing.T) {
 	if exit.ExitCode == nil || *exit.ExitCode != 0 || exit.Error != nil {
 		t.Errorf("exit = %+v, want a clean run", exit)
 	}
-	if !f.rec.has("DELETE " + sessionsPath + testToken) {
+	if !f.rec.has("DELETE " + egressctl.SessionsPath + testToken) {
 		t.Errorf("DELETE was not attempted: %v", f.rec.list())
 	}
 }
@@ -822,33 +823,10 @@ func TestTimeoutFor(t *testing.T) {
 	}
 }
 
-func TestNewControlRejectsBadURLs(t *testing.T) {
-	tests := []struct {
-		name, url, secret, want string
-	}{
-		{name: "not loopback", url: "http://10.0.0.1:3129", secret: "s", want: "loopback"},
-		{name: "a name, not an address", url: "http://localhost:3129", secret: "s", want: "loopback"},
-		{name: "wrong scheme", url: "file:///etc/passwd", secret: "s", want: "scheme"},
-		{name: "not a URL", url: "http://[::1", secret: "s", want: "not a URL"},
-		{name: "no secret", url: "http://127.0.0.1:3129", want: "secret is missing"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := newControl(tc.url, tc.secret, nil)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err = %v, want one mentioning %q", err, tc.want)
-			}
-		})
-	}
-	c, err := newControl("http://127.0.0.1:3129/", "s", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.base != "http://127.0.0.1:3129" {
-		t.Errorf("base = %q, want the trailing slash removed", c.base)
-	}
-}
-
+// Control URL validation and redaction now live in internal/egressctl; see
+// TestNewRejectsBadURLs and TestRedactURLDropsTheToken there. This test keeps
+// the agentx-level integration: a closed control server must still fail
+// without leaking the session token into the agent.exit error or the log.
 func TestRedactURLDropsTheToken(t *testing.T) {
 	f := newFixture(t, nil)
 	// A closed server makes the control call fail with an *url.Error whose

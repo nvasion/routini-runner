@@ -39,6 +39,7 @@ func TestSaveLoadPermissions(t *testing.T) {
 		`"agentImagePrefixes": [`,
 		`"ghcr.io/nvasion/"`,
 		`"maxConcurrentAgents": 2`,
+		`"maxEnvironments": 4`,
 		`"dockerHost": ""`,
 		`"containerRuntime": ""`,
 	} {
@@ -63,6 +64,9 @@ func TestNewAgentDefaults(t *testing.T) {
 	if c.MaxConcurrentAgents != DefaultMaxConcurrentAgents {
 		t.Errorf("New(): maxConcurrentAgents = %d, want %d", c.MaxConcurrentAgents, DefaultMaxConcurrentAgents)
 	}
+	if c.MaxEnvironments != DefaultMaxEnvironments {
+		t.Errorf("New(): maxEnvironments = %d, want %d", c.MaxEnvironments, DefaultMaxEnvironments)
+	}
 	if !reflect.DeepEqual(c.AgentImagePrefixes, []string{"ghcr.io/nvasion/"}) {
 		t.Errorf("New(): agentImagePrefixes = %#v", c.AgentImagePrefixes)
 	}
@@ -85,6 +89,7 @@ func TestAgentConfigRoundTrip(t *testing.T) {
 	c.Capabilities.Agents = true
 	c.AgentImagePrefixes = []string{"ghcr.io/nvasion/", "registry.example.com/agents/"}
 	c.MaxConcurrentAgents = 5
+	c.MaxEnvironments = 3
 	c.DockerHost = "tcp://127.0.0.1:2375"
 	c.ContainerRuntime = RuntimeGvisor
 	if err := Save(path, c); err != nil {
@@ -112,7 +117,7 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Capabilities.Exec || !c.Capabilities.Pty || c.MaxConcurrentExec != 8 {
+	if !c.Capabilities.Exec || !c.Capabilities.Pty || c.MaxConcurrentExec != 8 || c.MaxEnvironments != DefaultMaxEnvironments {
 		t.Errorf("defaults not applied: %+v", c)
 	}
 	c, err = Load(write(`{"url":"https://x.example","credential":"rrc_x","capabilities":{"exec":true,"pty":false},"maxConcurrentExec":2,"caFile":"/tmp/ca.pem"}`))
@@ -137,58 +142,80 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 func TestLoadAgentDefaults(t *testing.T) {
 	const base = `"url":"https://x.example","credential":"rrc_x"`
 	tests := []struct {
-		name           string
-		json           string
-		wantAgents     bool
-		wantPrefixes   []string
-		wantMaxAgents  int
-		wantDockerHost string
-		wantRuntime    string
+		name                string
+		json                string
+		wantAgents          bool
+		wantPrefixes        []string
+		wantMaxAgents       int
+		wantMaxEnvironments int
+		wantDockerHost      string
+		wantRuntime         string
 	}{
 		{
-			name:          "all agent fields missing",
-			json:          `{` + base + `}`,
-			wantPrefixes:  []string{"ghcr.io/nvasion/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "all agent fields missing",
+			json:                `{` + base + `}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 		{
-			name:          "explicit empty prefix list falls back to the default",
-			json:          `{` + base + `,"agentImagePrefixes":[]}`,
-			wantPrefixes:  []string{"ghcr.io/nvasion/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "explicit empty prefix list falls back to the default",
+			json:                `{` + base + `,"agentImagePrefixes":[]}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 		{
-			name:          "null prefix list falls back to the default",
-			json:          `{` + base + `,"agentImagePrefixes":null}`,
-			wantPrefixes:  []string{"ghcr.io/nvasion/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "null prefix list falls back to the default",
+			json:                `{` + base + `,"agentImagePrefixes":null}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 		{
-			name:          "blank prefixes are dropped",
-			json:          `{` + base + `,"agentImagePrefixes":["","  ","ghcr.io/other/"]}`,
-			wantPrefixes:  []string{"ghcr.io/other/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "blank prefixes are dropped",
+			json:                `{` + base + `,"agentImagePrefixes":["","  ","ghcr.io/other/"]}`,
+			wantPrefixes:        []string{"ghcr.io/other/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 		{
-			name:           "explicit values are kept",
-			json:           `{` + base + `,"capabilities":{"exec":true,"pty":true,"agents":true},"agentImagePrefixes":["registry.example.com/a/"],"maxConcurrentAgents":4,"dockerHost":"tcp://127.0.0.1:2375","containerRuntime":"runsc"}`,
-			wantAgents:     true,
-			wantPrefixes:   []string{"registry.example.com/a/"},
-			wantMaxAgents:  4,
-			wantDockerHost: "tcp://127.0.0.1:2375",
-			wantRuntime:    RuntimeGvisor,
+			name:                "explicit values are kept",
+			json:                `{` + base + `,"capabilities":{"exec":true,"pty":true,"agents":true},"agentImagePrefixes":["registry.example.com/a/"],"maxConcurrentAgents":4,"maxEnvironments":6,"dockerHost":"tcp://127.0.0.1:2375","containerRuntime":"runsc"}`,
+			wantAgents:          true,
+			wantPrefixes:        []string{"registry.example.com/a/"},
+			wantMaxAgents:       4,
+			wantMaxEnvironments: 6,
+			wantDockerHost:      "tcp://127.0.0.1:2375",
+			wantRuntime:         RuntimeGvisor,
 		},
 		{
-			name:          "zero maxConcurrentAgents means 2",
-			json:          `{` + base + `,"maxConcurrentAgents":0}`,
-			wantPrefixes:  []string{"ghcr.io/nvasion/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "zero maxConcurrentAgents means 2",
+			json:                `{` + base + `,"maxConcurrentAgents":0}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 		{
-			name:          "negative maxConcurrentAgents means 2",
-			json:          `{` + base + `,"maxConcurrentAgents":-7}`,
-			wantPrefixes:  []string{"ghcr.io/nvasion/"},
-			wantMaxAgents: DefaultMaxConcurrentAgents,
+			name:                "negative maxConcurrentAgents means 2",
+			json:                `{` + base + `,"maxConcurrentAgents":-7}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
+		},
+		{
+			name:                "zero maxEnvironments means 4",
+			json:                `{` + base + `,"maxEnvironments":0}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
+		},
+		{
+			name:                "negative maxEnvironments means 4",
+			json:                `{` + base + `,"maxEnvironments":-3}`,
+			wantPrefixes:        []string{"ghcr.io/nvasion/"},
+			wantMaxAgents:       DefaultMaxConcurrentAgents,
+			wantMaxEnvironments: DefaultMaxEnvironments,
 		},
 	}
 	for _, tt := range tests {
@@ -209,6 +236,9 @@ func TestLoadAgentDefaults(t *testing.T) {
 			}
 			if c.MaxConcurrentAgents != tt.wantMaxAgents {
 				t.Errorf("maxConcurrentAgents = %d, want %d", c.MaxConcurrentAgents, tt.wantMaxAgents)
+			}
+			if c.MaxEnvironments != tt.wantMaxEnvironments {
+				t.Errorf("maxEnvironments = %d, want %d", c.MaxEnvironments, tt.wantMaxEnvironments)
 			}
 			if c.DockerHost != tt.wantDockerHost {
 				t.Errorf("dockerHost = %q, want %q", c.DockerHost, tt.wantDockerHost)
