@@ -32,6 +32,17 @@ type Facts struct {
 	DiskUsedPct *int     `json:"diskUsedPct,omitempty"`
 	Addresses   []string `json:"addresses,omitempty"`
 	Docker      *Docker  `json:"docker,omitempty"`
+	Agents      *Agents  `json:"agents,omitempty"`
+}
+
+// Agents says why this runner does or does not serve agents, so a console can
+// tell an admin what to do on the host (PROTOCOL.md section 2.2). Like Docker,
+// only the control connection fills it in.
+type Agents struct {
+	// Configured is capabilities.agents in config.json.
+	Configured bool `json:"configured"`
+	// Error is why Docker did not answer the startup ping, when Configured.
+	Error string `json:"error,omitempty"`
 }
 
 // Docker reports the local Docker daemon and this runner's agent capacity

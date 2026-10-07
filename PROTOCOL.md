@@ -23,7 +23,7 @@ The runner sends:
 POST {url}/api/runner/enroll
 Content-Type: application/json
 
-{ "token": "rre_xxx", "name": "web-01", "hostname": "web-01.prod", "os": "linux", "arch": "amd64", "version": "0.2.0" }
+{ "token": "rre_xxx", "name": "web-01", "hostname": "web-01.prod", "os": "linux", "arch": "amd64", "version": "0.3.0" }
 ```
 
 `name` is optional. Without it, the server uses the name given to the enrollment token, or else the hostname.
@@ -86,11 +86,11 @@ All messages are **JSON text frames**, one object each, with a `type` field. Unk
 The runner sends `hello` immediately after the connection opens:
 
 ```json
-{ "type": "hello", "protocol": 1, "version": "0.2.0", "hostname": "web-01.prod", "os": "linux", "arch": "amd64",
-  "capabilities": ["exec", "pty", "agents"], "facts": { ...see 2.2 } }
+{ "type": "hello", "protocol": 1, "version": "0.3.0", "hostname": "web-01.prod", "os": "linux", "arch": "amd64",
+  "capabilities": ["exec", "pty", "agents", "update"], "facts": { ...see 2.2 } }
 ```
 
-`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. A server must not send the frames of a feature it was not offered.
+`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` appears only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. `"update"` appears when the root-owned update helper is installed and `sudo -n routini-runner-update --check` answered `ok` at startup (section 2.7). A server must not send the frames of a feature it was not offered.
 
 The server replies with `welcome`:
 
@@ -114,7 +114,8 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
   "memTotalMb": 7972, "memUsedPct": 41,
   "diskTotalGb": 78.6, "diskUsedPct": 63,
   "addresses": ["10.0.0.11", "fd00::11"],
-  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2 }
+  "docker": { "available": true, "version": "27.3.1", "agentsRunning": 0, "maxAgents": 2 },
+  "agents": { "configured": true }
 }
 ```
 
@@ -122,6 +123,7 @@ The runner sends facts in `hello`, then every **60 s** as `{"type": "facts", "fa
 - `diskUsedPct` covers `/` and excludes reserved blocks: `(total - free) / (total - free + avail)`, which is the same as `df`.
 - `addresses` lists non-loopback interface addresses.
 - `docker` reports the local Docker daemon: `available` says whether it answered at the last probe and `version` is what its ping returned. `agentsRunning` is the number of agent tasks running now and `maxAgents` is `maxConcurrentAgents`, so a console can show spare capacity. The whole object is omitted when Docker is unreachable; an older runner omits it too, which is why the protocol version stays 1.
+- `agents` says why agents are or are not served, so a console can tell an admin what to do on the host. `configured` is `capabilities.agents` in `config.json`. When it is `true` but Docker did not answer the startup ping, `error` holds the reason (at most 300 bytes, e.g. a permission error on the Docker socket). Runners before 0.3.0 omit the object.
 
 ### 2.3 Exec: run a command
 
@@ -296,6 +298,32 @@ Any failure at any step produces one `agent.exit` with `exitCode: null` and a sh
 **If the control connection drops,** the runner kills all agent containers (the ones labelled `routini.managed=true` plus `routini.run`) and closes their sessions, for the same reason exec tasks are cancelled: their results can no longer be delivered. Closing the sessions also drops the real credentials from the proxy's memory, so nothing usable is left on an unsupervised host. The runner does not re-send output after reconnecting. `routini-egress` stays up, because it is shared and holds the CA.
 
 **Secrets.** Real credentials appear only in `egress.session.bindings`. The runner hands them to the local egress proxy over loopback, where they live in memory only, for the life of the session. They are never written to disk, never logged, and never visible inside the agent container: there, `ANTHROPIC_API_KEY` is the placeholder `routini-brokered-credential`, and the proxy swaps in the real value for allowed hosts according to the bindings.
+
+### 2.7 Updates
+
+These frames exist only for a runner that advertised the `update` capability (section 2.1).
+
+The runner runs as an unprivileged user and its binary is owned by root, so it cannot replace itself. `install.sh` installs a root-owned helper, `/usr/local/sbin/routini-runner-update`, and a sudoers rule that lets the runner's user run exactly `routini-runner-update --check` and `routini-runner-update vX.Y.Z`. The helper downloads that release from GitHub, checks it against the release's `sha256sums.txt` (the same check `install.sh` does), installs it, and schedules a restart of the service.
+
+The server asks for an update:
+
+```json
+{ "type": "runner.update", "id": "request-uuid", "version": "v0.3.1" }
+```
+
+The runner answers with exactly one result:
+
+```json
+{ "type": "runner.update.result", "id": "request-uuid", "version": "v0.3.1", "ok": true, "error": null,
+  "output": "checksum verified\ninstalled routini-runner 0.3.1\nrestart of routini-runner scheduled" }
+```
+
+- `version` must be a release tag, `vMAJOR.MINOR.PATCH`; anything else is refused with `"invalid version (want vX.Y.Z)"` before the helper runs.
+- Other refusals: `"updates are not enabled on this runner; reinstall it with install.sh to allow them"`, `"already running vX.Y.Z"`, and `"an update is already running"` (one update at a time).
+- `output` is the end of the helper's output (at most 4 KiB). On failure, `ok` is `false` and `error` says what failed.
+- After `ok: true` the service restarts within a few seconds. The runner then reconnects and its `hello` carries the new `version`, which is how the server confirms the update took effect.
+
+Switching agents on or off is **not** possible through this channel: it changes membership of the `docker` group, which is root-equivalent, so the helper only does it for root on the host (`sudo routini-runner-update --enable-agents`).
 
 ## 3. Versioning
 

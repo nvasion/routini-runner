@@ -1,0 +1,162 @@
+#!/bin/sh
+# routini-runner-update: the root-owned helper that changes this host's
+# routini-runner. install.sh installs it as /usr/local/sbin/routini-runner-update
+# and adds a sudoers rule letting the runner's user run exactly:
+#
+#   routini-runner-update --check     (prints "ok": updates are possible)
+#   routini-runner-update vX.Y.Z      (install that release, then restart)
+#
+# That is how Routini's "Update runner" button works (PROTOCOL.md section 2.7).
+# Root on this host can also switch agents on or off; Routini cannot, because
+# agents need the docker group, which is root-equivalent:
+#
+#   sudo routini-runner-update --enable-agents
+#   sudo routini-runner-update --disable-agents
+set -eu
+
+REPO="nvasion/routini-runner"
+BIN="/usr/local/bin/routini-runner"
+SELF="/usr/local/sbin/routini-runner-update"
+CONFIG="/etc/routini-runner/config.json"
+RUNNER_USER="routini-runner"
+SERVICE="routini-runner"
+DOCKER_GROUP="docker"
+LOCK="/run/routini-runner-update.lock"
+
+say() { printf 'routini-runner-update: %s\n' "$*"; }
+die() { say "error: $*" >&2; exit 1; }
+
+usage() {
+	cat >&2 <<EOF
+Usage: routini-runner-update vX.Y.Z | --check | --enable-agents | --disable-agents
+
+  vX.Y.Z            install that routini-runner release (checksum-verified) and restart
+  --check           print "ok" when updates are possible (used by the runner)
+  --enable-agents   let Routini run agents here: adds $RUNNER_USER to the $DOCKER_GROUP
+                    group (ROOT-EQUIVALENT) and sets capabilities.agents; root only
+  --disable-agents  undo --enable-agents; root only
+EOF
+	exit 2
+}
+
+# valid_tag TAG: exactly vMAJOR.MINOR.PATCH, nothing else.
+valid_tag() {
+	printf '%s' "$1" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+# from_runner: invoked by the runner's user through sudo. Only --check and a
+# release tag are honoured then, whatever the sudoers rule happens to allow.
+from_runner() {
+	[ "${SUDO_USER:-}" = "$RUNNER_USER" ]
+}
+
+# restart_later queues a restart of the service and returns at once. The
+# helper usually runs as a child of the runner, inside the service's cgroup,
+# so it must not wait for the restart that is about to stop it.
+restart_later() {
+	if command -v systemd-run >/dev/null 2>&1 &&
+		systemd-run --quiet --no-block --collect --on-active=2 --unit="routini-runner-restart-$$" \
+			systemctl restart "$SERVICE" >/dev/null 2>&1; then
+		say "restart of $SERVICE scheduled"
+	else
+		systemctl --no-block restart "$SERVICE"
+		say "restart of $SERVICE queued"
+	fi
+}
+
+# When ROUTINI_UPDATE_LIB is set, only the functions above are defined.
+# scripts/install_test.sh uses this.
+if [ -n "${ROUTINI_UPDATE_LIB:-}" ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
+[ $# -eq 1 ] || usage
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+update() {
+	TAG="$1"
+	valid_tag "$TAG" || die "invalid version $TAG (want vX.Y.Z)"
+	command -v tar >/dev/null 2>&1 || die "tar is required"
+	case "$(uname -m)" in
+	x86_64 | amd64) ARCH="amd64" ;;
+	aarch64 | arm64) ARCH="arm64" ;;
+	*) die "unsupported architecture: $(uname -m)" ;;
+	esac
+	if command -v curl >/dev/null 2>&1; then
+		fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+	elif command -v wget >/dev/null 2>&1; then
+		fetch() { wget -q -O "$2" "$1"; }
+	else
+		die "curl or wget is required"
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256() { sha256sum "$1" | awk '{print $1}'; }
+	elif command -v shasum >/dev/null 2>&1; then
+		sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+	else
+		die "sha256sum or shasum is required"
+	fi
+
+	# One update at a time.
+	mkdir "$LOCK" 2>/dev/null || die "another update is running"
+	TMP="$(mktemp -d)"
+	trap 'rm -rf "$TMP"; rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+	TARBALL="routini-runner_${TAG#v}_linux_${ARCH}.tar.gz"
+	BASE_URL="https://github.com/$REPO/releases/download/$TAG"
+	say "downloading $TARBALL"
+	fetch "$BASE_URL/$TARBALL" "$TMP/$TARBALL" || die "download failed: $BASE_URL/$TARBALL"
+	fetch "$BASE_URL/sha256sums.txt" "$TMP/sha256sums.txt" || die "download failed: $BASE_URL/sha256sums.txt"
+	EXPECTED="$(awk -v f="$TARBALL" '$2 == f || $2 == "*" f {print $1}' "$TMP/sha256sums.txt" | head -n 1)"
+	[ -n "$EXPECTED" ] || die "$TARBALL is not listed in sha256sums.txt"
+	ACTUAL="$(sha256 "$TMP/$TARBALL")"
+	[ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $TARBALL"
+	say "checksum verified"
+
+	tar -xzf "$TMP/$TARBALL" -C "$TMP" routini-runner || die "could not extract routini-runner"
+	install -m 0755 "$TMP/routini-runner" "$BIN.new"
+	mv -f "$BIN.new" "$BIN"
+	say "installed $("$BIN" version)"
+
+	# Releases from 0.3.0 on carry this helper too; keep it current.
+	if tar -xzf "$TMP/$TARBALL" -C "$TMP" routini-runner-update 2>/dev/null; then
+		install -m 0755 -o root -g root "$TMP/routini-runner-update" "$SELF.new"
+		mv -f "$SELF.new" "$SELF"
+	fi
+
+	restart_later
+}
+
+set_agents() {
+	from_runner && die "agents can only be switched by root on this host"
+	if [ "$1" = "enable" ]; then
+		say "WARNING: the $DOCKER_GROUP group is ROOT-EQUIVALENT: $RUNNER_USER becomes effectively root"
+		getent group "$DOCKER_GROUP" >/dev/null 2>&1 || die "no $DOCKER_GROUP group: install Docker 24 or newer first"
+		if ! id -nG "$RUNNER_USER" | tr ' ' '\n' | grep -qx "$DOCKER_GROUP"; then
+			usermod -aG "$DOCKER_GROUP" "$RUNNER_USER" || die "could not add $RUNNER_USER to $DOCKER_GROUP"
+			say "added $RUNNER_USER to the $DOCKER_GROUP group"
+		fi
+		"$BIN" agents enable --config "$CONFIG"
+	else
+		"$BIN" agents disable --config "$CONFIG"
+		if id -nG "$RUNNER_USER" | tr ' ' '\n' | grep -qx "$DOCKER_GROUP"; then
+			gpasswd -d "$RUNNER_USER" "$DOCKER_GROUP" >/dev/null || die "could not remove $RUNNER_USER from $DOCKER_GROUP"
+			say "removed $RUNNER_USER from the $DOCKER_GROUP group"
+		fi
+	fi
+	systemctl restart "$SERVICE"
+	say "restarted $SERVICE"
+}
+
+case "$1" in
+--check) echo ok ;;
+--enable-agents) set_agents enable ;;
+--disable-agents) set_agents disable ;;
+-h | --help) usage ;;
+*)
+	if from_runner && ! valid_tag "$1"; then
+		die "only --check and vX.Y.Z are allowed from the runner"
+	fi
+	update "$1"
+	;;
+esac

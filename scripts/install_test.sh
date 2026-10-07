@@ -227,6 +227,57 @@ case "$warning" in
 *rrc_*) fail "warn_docker_group: the warning leaks a credential" ;;
 esac
 
+# --- sudoers_rule: what the runner's user may run as root ---
+rule="$(sudoers_rule)"
+case "$rule" in
+*"$RUNNER_USER ALL=(root) NOPASSWD: $UPDATER --check, $UPDATER v[0-9]*"*) pass "sudoers_rule: only --check and vX..." ;;
+*) fail "sudoers_rule: unexpected rule: $rule" ;;
+esac
+case "$rule" in
+*"ALL=(root) NOPASSWD: ALL"* | *"--enable-agents"*) fail "sudoers_rule: grants more than the update helper" ;;
+esac
+if command -v visudo >/dev/null 2>&1; then
+	printf '%s\n' "$rule" >"$TMPROOT/sudoers"
+	if visudo -cf "$TMPROOT/sudoers" >/dev/null 2>&1; then
+		pass "sudoers_rule: visudo accepts it"
+	else
+		fail "sudoers_rule: visudo rejects it: $(visudo -cf "$TMPROOT/sudoers" 2>&1)"
+	fi
+fi
+
+# --- routini-runner-update: what it accepts, and from whom ---
+# shellcheck source=/dev/null
+ROUTINI_UPDATE_LIB=1 . "$SCRIPT_DIR/routini-runner-update"
+for tag in v0.3.0 v10.20.30; do
+	valid_tag "$tag" && pass "valid_tag $tag" || fail "valid_tag rejects $tag"
+done
+for tag in 0.3.0 v0.3 v0.3.0-rc1 "v0.3.0 --enable-agents" "v0.3.0;reboot" --enable-agents ""; do
+	valid_tag "$tag" && fail "valid_tag accepts '$tag'" || pass "valid_tag rejects '$tag'"
+done
+SUDO_USER="$RUNNER_USER" from_runner && pass "from_runner: sudo by $RUNNER_USER" || fail "from_runner: missed $RUNNER_USER"
+SUDO_USER="alice" from_runner && fail "from_runner: alice counted as the runner" || pass "from_runner: alice is a person"
+(unset SUDO_USER; from_runner) && fail "from_runner: plain root counted as the runner" || pass "from_runner: plain root"
+
+# The helper refuses anything but --check and a tag from the runner, before
+# it touches the network. Run it with a fake id that claims root.
+FAKEBIN="$TMPROOT/fakebin"
+mkdir -p "$FAKEBIN"
+printf '#!/bin/sh\necho 0\n' >"$FAKEBIN/id"
+chmod +x "$FAKEBIN/id"
+for args in "--enable-agents" "--disable-agents" "latest" "v0.3.0 extra"; do
+	# shellcheck disable=SC2086 # split args on purpose
+	if out="$(PATH="$FAKEBIN:$PATH" SUDO_USER="$RUNNER_USER" sh "$SCRIPT_DIR/routini-runner-update" $args 2>&1)"; then
+		fail "routini-runner-update '$args' from the runner succeeded: $out"
+	else
+		pass "routini-runner-update refuses '$args' from the runner"
+	fi
+done
+if out="$(PATH="$FAKEBIN:$PATH" SUDO_USER="$RUNNER_USER" sh "$SCRIPT_DIR/routini-runner-update" --check 2>&1)" && [ "$out" = "ok" ]; then
+	pass "routini-runner-update --check prints ok"
+else
+	fail "routini-runner-update --check: $out"
+fi
+
 if [ "$FAILURES" -eq 0 ]; then
 	echo "install.sh: all tests passed"
 else

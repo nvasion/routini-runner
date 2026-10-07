@@ -51,6 +51,7 @@ Usage:
   routini-runner run [--config PATH]
   routini-runner up [--config PATH]
   routini-runner facts
+  routini-runner agents enable|disable|status [--config PATH]
   routini-runner version
 
 Commands:
@@ -59,6 +60,8 @@ Commands:
   up       for containers: enroll from $ROUTINI_RUNNER_URL / $ROUTINI_RUNNER_TOKEN
            (optional $ROUTINI_RUNNER_NAME) if no config exists yet, then run
   facts    print the host facts sent to Routini, as JSON
+  agents   switch capabilities.agents in the config (restart the service afterwards);
+           routini-runner-update --enable-agents also handles the docker group
   version  print the version
 
 The config path defaults to $ROUTINI_RUNNER_CONFIG, else /etc/routini-runner/config.json.
@@ -94,6 +97,8 @@ func realMain(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		return c.cmdUp(rest)
 	case "facts":
 		return c.cmdFacts(rest)
+	case "agents":
+		return c.cmdAgents(rest)
 	case "version", "--version", "-v":
 		fmt.Fprintf(stdout, "routini-runner %s\n", version.Version)
 		return exitOK
@@ -300,6 +305,57 @@ func (c *cli) cmdFacts(args []string) int {
 	}
 	fmt.Fprintln(c.stdout, string(b))
 	return exitOK
+}
+
+// cmdAgents switches capabilities.agents in an enrolled runner's config. It
+// does not touch the docker group or restart anything: the update helper
+// (routini-runner-update --enable-agents) does those around it.
+func (c *cli) cmdAgents(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(c.stderr, "agents: want enable, disable or status")
+		return exitUsage
+	}
+	action := args[0]
+	flags := c.newFlags("agents " + action)
+	cfgPath := flags.String("config", "", "config path (default $ROUTINI_RUNNER_CONFIG or "+config.DefaultPath+")")
+	if err := flags.Parse(args[1:]); err != nil {
+		return exitUsage
+	}
+	if flags.NArg() > 0 {
+		fmt.Fprintf(c.stderr, "agents: unexpected arguments: %s\n", strings.Join(flags.Args(), " "))
+		return exitUsage
+	}
+	path := config.ResolvePath(*cfgPath)
+	cfg, err := config.Load(path)
+	if err != nil {
+		c.log.Printf("agents: %v", err)
+		return exitError
+	}
+	switch action {
+	case "status":
+		state := "disabled"
+		if cfg.Capabilities.Agents {
+			state = "enabled"
+		}
+		fmt.Fprintf(c.stdout, "agents are %s in %s\n", state, path)
+		return exitOK
+	case "enable", "disable":
+		want := action == "enable"
+		if cfg.Capabilities.Agents == want {
+			fmt.Fprintf(c.stdout, "agents are already %sd in %s\n", action, path)
+			return exitOK
+		}
+		cfg.Capabilities.Agents = want
+		if err := config.SaveKeepOwner(path, cfg); err != nil {
+			c.log.Printf("agents: %v", err)
+			return exitError
+		}
+		fmt.Fprintf(c.stdout, "agents %sd in %s; restart routini-runner to apply\n", action, path)
+		return exitOK
+	default:
+		fmt.Fprintf(c.stderr, "agents: unknown action %q (want enable, disable or status)\n", action)
+		return exitUsage
+	}
 }
 
 func fileExists(path string) bool {

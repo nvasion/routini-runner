@@ -4,6 +4,32 @@ All notable changes to `routini-runner` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+### Added
+
+- **Updates from the Routini console.** A new `update` capability and
+  `runner.update` / `runner.update.result` frames (PROTOCOL.md section 2.7).
+  - `install.sh` installs a root-owned helper,
+    `/usr/local/sbin/routini-runner-update`.
+  - It also adds a sudoers rule that lets the runner's user run only
+    `routini-runner-update --check` and `routini-runner-update vX.Y.Z`.
+  - The helper downloads and sha256-verifies that release, installs it, and
+    schedules a restart.
+  - Opt out with `install.sh --no-remote-update`.
+- **`routini-runner-update --enable-agents` / `--disable-agents`.** Root on
+  the host can switch agents (docker group plus `capabilities.agents`) without
+  re-running the installer. Routini cannot trigger this.
+- **`routini-runner agents enable|disable|status`.** Edits
+  `capabilities.agents` in the config and keeps the file's owner and mode.
+- **`facts.agents`.** `{ configured, error }` tells the console why a host
+  does not run agents: not configured, or Docker refused (e.g. a permission
+  error on the socket).
+
+### Changed
+
+- Release archives now include `routini-runner-update`.
+
 ## 0.2.0
 
 ### Added

@@ -206,6 +206,22 @@ func Save(path string, c *Config) error {
 	return nil
 }
 
+// SaveKeepOwner is Save for root tools that edit an existing runner config
+// (routini-runner agents enable): the rewritten file keeps its previous owner,
+// so the runner's user can still read it.
+func SaveKeepOwner(path string, c *Config) error {
+	uid, gid, ok := fileOwner(path)
+	if err := Save(path, c); err != nil {
+		return err
+	}
+	if ok {
+		if err := os.Chown(path, uid, gid); err != nil {
+			return fmt.Errorf("restore config owner: %w", err)
+		}
+	}
+	return nil
+}
+
 // TLSConfig returns a TLS client config that trusts the system roots plus,
 // when caFile is non-empty, the PEM certificates in caFile.
 func TLSConfig(caFile string) (*tls.Config, error) {
