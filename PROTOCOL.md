@@ -91,7 +91,7 @@ The runner sends `hello` immediately after the connection opens:
   "capabilities": ["exec", "pty", "agents", "environments", "update"], "facts": { ...see 2.2 } }
 ```
 
-`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` and `"environments"` appear only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping at startup, and always together; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. `"update"` appears when the root-owned update helper is installed and `sudo -n routini-runner-update --check` answered `ok` at startup (section 2.7). A server must not send the frames of a feature it was not offered.
+`capabilities` lists only the features this runner will actually serve. `exec` and `pty` follow the config flags of the same name. `"agents"` and `"environments"` appear only when `capabilities.agents` is `true` in `config.json` **and** the local Docker daemon answered a ping, and always together; a runner with agents enabled in config but no reachable Docker daemon sends `["exec", "pty"]`. It then re-pings Docker every 30 s, and when the daemon answers it enables agents and environments and sends `{"type": "capabilities", "capabilities": [...]}`, which replaces the list from `hello` without reconnecting. Runners before 0.4.1 never send it, and a server that does not know it ignores it. `"update"` appears when the root-owned update helper is installed and `sudo -n routini-runner-update --check` answered `ok` at startup (section 2.7). A server must not send the frames of a feature it was not offered.
 
 The server replies with `welcome`:
 

@@ -114,7 +114,7 @@ func (m *Manager) OpenTTY(msg TTYOpenMsg, send SendFunc) {
 		m.logf("env.tty.open without id ignored")
 		return
 	}
-	if !m.enabled {
+	if !m.enabled.Load() {
 		send(ttyErrorReply(msg.ID, ErrDisabled))
 		return
 	}
@@ -145,7 +145,7 @@ func (m *Manager) OpenTTY(msg TTYOpenMsg, send SendFunc) {
 func (m *Manager) startTTY(s *ttySession, msg TTYOpenMsg) error {
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	info, err := m.opts.Docker.InspectEnv(ctx, msg.ContainerID)
+	info, err := m.docker().InspectEnv(ctx, msg.ContainerID)
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (m *Manager) startTTY(s *ttySession, msg TTYOpenMsg) error {
 		return errors.New(ErrContainerMissing)
 	}
 
-	tty, err := m.opts.Docker.ExecTTY(context.Background(), msg.ContainerID, ttySize(msg.Cols, 80), ttySize(msg.Rows, 24))
+	tty, err := m.docker().ExecTTY(context.Background(), msg.ContainerID, ttySize(msg.Cols, 80), ttySize(msg.Rows, 24))
 	if err != nil {
 		return err
 	}

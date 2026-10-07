@@ -370,7 +370,9 @@ cat >"$UNIT" <<'EOF'
 Description=Routini runner (runs commands and terminals for Routini)
 Documentation=https://github.com/nvasion/routini-runner
 Wants=network-online.target
-After=network-online.target
+# docker.service only orders startup when Docker is installed and enabled;
+# the runner also re-checks Docker every 30 s while agents are on.
+After=network-online.target docker.service
 
 [Service]
 Type=simple

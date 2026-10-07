@@ -3,5 +3,5 @@ package version
 
 // Version is the runner version. Release builds override it with
 //
-//	-ldflags "-X github.com/nvasion/routini-runner/internal/version.Version=0.4.0"
-var Version = "0.4.0"
+//	-ldflags "-X github.com/nvasion/routini-runner/internal/version.Version=0.4.1"
+var Version = "0.4.1"
