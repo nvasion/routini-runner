@@ -126,11 +126,16 @@ func (m *Manager) sessionOpen(msg OpMsg, send SendFunc) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
+	// Remember the token before opening it: a Disconnect that lands while the
+	// PUT is in flight must still close this session, or the proxy would keep
+	// its credentials on an unsupervised host. Closing a session that never
+	// opened is harmless.
+	m.rememberToken(token)
 	if err := ctrl.OpenSession(ctx, token, a.Session); err != nil {
+		m.forgetToken(token)
 		send(doneErr(msg.ID, err.Error()))
 		return
 	}
-	m.rememberToken(token)
 
 	pem, err := ctrl.CA(ctx)
 	if err != nil {
