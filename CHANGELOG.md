@@ -4,6 +4,31 @@ All notable changes to `routini-runner` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.1
+
+### Fixed
+
+- **Agents stayed off when Docker started after the runner.** Docker was
+  checked once, at startup. After a reboot where the runner came up first,
+  or when Docker was started by hand later, agents and environments stayed
+  unavailable until the runner was restarted.
+  - The runner now re-checks Docker every 30 s while `capabilities.agents`
+    is on and the daemon has not answered.
+  - Once it answers, it enables agents and environments and sends the
+    server a new `capabilities` frame, without reconnecting (PROTOCOL.md 2.1).
+  - `install.sh` now orders the service after `docker.service`.
+- **"open egress session: … connection reset by peer".** The published
+  `routini-egress` image could not write its CA to the runner's volume, so it
+  crashed on start, and the runner only saw a reset connection. The image is
+  fixed in routini. The runner now:
+  - recreates an egress container that crashed (instead of restarting it), and
+    one whose image tag now points to a newer pulled image;
+  - pulls the egress image whenever it (re)creates the container, so a
+    republished fix reaches hosts without a manual `docker pull`;
+  - waits up to 15 s for the proxy's control API before using it;
+  - when the proxy does not come up, reports the proxy's own error line
+    (for example `Error: EACCES: …`).
+
 ## 0.4.0
 
 ### Added

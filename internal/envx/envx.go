@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
@@ -176,8 +177,11 @@ type Options struct {
 // Manager tracks running environment exec ops, open terminals and the egress
 // sessions this runner has opened.
 type Manager struct {
-	opts    Options
-	enabled bool
+	opts Options
+	// enabled and daemon start from Options and change once, when Enable
+	// switches a Manager on after Docker answered late (see Enable).
+	enabled atomic.Bool
+	daemon  atomic.Pointer[daemonRef]
 	// secret is the egress secret shared with agentx and the routini-egress
 	// container; see Options.EgressSecret. It is never logged.
 	secret string
@@ -207,16 +211,19 @@ func New(opts Options) *Manager {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = egressctl.DefaultHTTPClient()
 	}
-	return &Manager{
-		opts: opts,
-		// A Manager without a daemon refuses every op rather than panicking
-		// on the first call.
-		enabled: opts.Enabled && opts.Docker != nil,
-		secret:  opts.EgressSecret,
-		execs:   make(map[string]*execJob),
-		ttys:    make(map[string]*ttySession),
-		tokens:  make(map[string]struct{}),
+	m := &Manager{
+		opts:   opts,
+		secret: opts.EgressSecret,
+		execs:  make(map[string]*execJob),
+		ttys:   make(map[string]*ttySession),
+		tokens: make(map[string]struct{}),
 	}
+	// A Manager without a daemon refuses every op rather than panicking on
+	// the first call.
+	if opts.Enabled {
+		m.Enable(opts.Docker)
+	}
+	return m
 }
 
 // Op handles env.op. It runs in its own goroutine and always reports exactly
@@ -252,7 +259,7 @@ const (
 )
 
 func (m *Manager) runOp(msg OpMsg, send SendFunc) {
-	if !m.enabled {
+	if !m.enabled.Load() {
 		send(doneErr(msg.ID, ErrDisabled))
 		return
 	}
@@ -380,12 +387,12 @@ func (m *Manager) newControlClient() (*egressctl.Client, error) {
 // number only ever feeds host facts, which must never block or fail the
 // connection over a transient daemon hiccup.
 func (m *Manager) Running() int {
-	if !m.enabled {
+	if !m.enabled.Load() {
 		return 0
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	n, err := m.opts.Docker.CountEnvContainers(ctx)
+	n, err := m.docker().CountEnvContainers(ctx)
 	if err != nil {
 		m.logf("environments: count running containers: %v", err)
 		return 0

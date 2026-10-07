@@ -1,18 +1,23 @@
 package dockerx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -59,15 +64,124 @@ func (d *dockerClient) EnsureEgress(ctx context.Context, ref, secret string) (st
 	if keep != nil {
 		url, err := d.runningEgressURL(ctx, keep)
 		if err == nil {
-			return url, nil
+			if err := d.awaitEgress(ctx, keep.ID, url, secret); err == nil {
+				return url, nil
+			}
+			// It was running but does not answer: start over below.
 		}
 		// Up to date but unusable, for instance because its control port is
-		// not bound to loopback: replace it rather than hand back a bad URL.
+		// not bound to loopback or the proxy is wedged: replace it rather than
+		// hand back a bad URL.
 		if rmErr := d.removeEgressContainer(ctx); rmErr != nil {
-			return "", errors.Join(err, rmErr)
+			if err != nil {
+				return "", errors.Join(err, rmErr)
+			}
+			return "", rmErr
 		}
 	}
-	return d.createEgress(ctx, ref, secret)
+	url, id, err := d.createEgress(ctx, ref, secret)
+	if err != nil {
+		return "", err
+	}
+	if err := d.awaitEgress(ctx, id, url, secret); err != nil {
+		return "", err
+	}
+	return url, nil
+}
+
+// EgressReadyTimeout bounds how long EnsureEgress waits for a routini-egress
+// control API to answer.
+var EgressReadyTimeout = 15 * time.Second
+
+// awaitEgress waits until the egress control API answers. When it does not,
+// the error carries the end of the container's log: that is where the real
+// cause is (a crash on startup), not in the "connection reset" the caller
+// would otherwise see.
+func (d *dockerClient) awaitEgress(ctx context.Context, id, url, secret string) error {
+	if d.egressReady == nil {
+		return nil
+	}
+	err := d.egressReady(ctx, url, secret)
+	if err == nil {
+		return nil
+	}
+	if why := d.crashReason(id); why != "" {
+		return fmt.Errorf("dockerx: %s did not start: %w; its log says: %s", EgressContainerName, err, why)
+	}
+	return fmt.Errorf("dockerx: %s did not start: %w", EgressContainerName, err)
+}
+
+// waitEgressReady polls GET <controlURL>/ca until it answers 200 or
+// EgressReadyTimeout passes.
+func waitEgressReady(ctx context.Context, controlURL, secret string) error {
+	ctx, cancel := context.WithTimeout(ctx, EgressReadyTimeout)
+	defer cancel()
+	client := &http.Client{Timeout: 2 * time.Second}
+	var last error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, controlURL+"/ca", nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+secret)
+		res, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+			res.Body.Close()
+			if res.StatusCode == http.StatusOK {
+				return nil
+			}
+			last = fmt.Errorf("control API answered HTTP %d", res.StatusCode)
+		} else {
+			last = errors.New("control API not answering")
+		}
+		select {
+		case <-ctx.Done():
+			return last
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// crashLogLines is how much of the container's output crashReason reads.
+const crashLogLines = 40
+
+// crashReason picks the line that explains a crash from the end of the
+// container's output: the first line naming an error (a Node stack trace puts
+// "Error: EACCES ..." above a dozen frames), else the last few lines. At most
+// 300 bytes, on one line.
+func (d *dockerClient) crashReason(id string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rc, err := d.api.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: strconv.Itoa(crashLogLines)})
+	if err != nil {
+		return ""
+	}
+	defer rc.Close()
+	var out bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &out, io.LimitReader(rc, 64<<10)); err != nil && out.Len() == 0 {
+		return ""
+	}
+	var lines []string
+	for _, l := range strings.Split(out.String(), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	why := ""
+	for _, l := range lines {
+		if strings.Contains(l, "Error") || strings.Contains(l, "error") {
+			why = l
+			break
+		}
+	}
+	if why == "" && len(lines) > 0 {
+		why = strings.Join(lines[max(0, len(lines)-3):], " | ")
+	}
+	if len(why) > 300 {
+		why = why[:300]
+	}
+	return strings.ToValidUTF8(why, "�")
 }
 
 // reusableEgress returns the existing egress container when it still matches
@@ -81,13 +195,34 @@ func (d *dockerClient) reusableEgress(ctx context.Context, ref, secret string) (
 	case err != nil:
 		return nil, fmt.Errorf("dockerx: inspect container %s: %w", EgressContainerName, err)
 	}
-	if egressDrifted(c, ref, secret) {
+	if egressDrifted(c, ref, secret) || egressCrashed(c) || d.egressImageStale(ctx, c, ref) {
 		if err := d.removeEgressContainer(ctx); err != nil {
 			return nil, err
 		}
 		return nil, nil
 	}
 	return &c, nil
+}
+
+// egressCrashed reports a container that is restarting or exited with an
+// error: starting it again would only repeat the crash (for instance an image
+// that cannot write its CA), so it is recreated instead, from a fresh pull.
+func egressCrashed(c types.ContainerJSON) bool {
+	if c.ContainerJSONBase == nil || c.State == nil {
+		return false
+	}
+	return c.State.Restarting || (!c.State.Running && c.State.ExitCode != 0)
+}
+
+// egressImageStale reports whether the local tag ref now names a different
+// image than the container runs (a newer one was pulled). Best effort: when
+// the image cannot be inspected the container is kept.
+func (d *dockerClient) egressImageStale(ctx context.Context, c types.ContainerJSON, ref string) bool {
+	if c.ContainerJSONBase == nil || c.Image == "" {
+		return false
+	}
+	img, _, err := d.api.ImageInspectWithRaw(ctx, ref)
+	return err == nil && img.ID != "" && img.ID != c.Image
 }
 
 // egressDrifted reports whether the existing container no longer matches the
@@ -124,16 +259,24 @@ func (d *dockerClient) runningEgressURL(ctx context.Context, c *types.ContainerJ
 	return d.egressControlURL(ctx, c.ID)
 }
 
-func (d *dockerClient) createEgress(ctx context.Context, ref, secret string) (string, error) {
+// createEgress creates and starts the egress container and returns its control
+// URL and id. With refreshEgress it pulls the image first, so a republished
+// image (a fixed :latest) is used without anyone pulling it on the host; a
+// failed pull falls back to the local image.
+func (d *dockerClient) createEgress(ctx context.Context, ref, secret string) (string, string, error) {
+	if d.refreshEgress {
+		_ = d.pullImage(ctx, ref)
+	}
 	cfg, host := egressConfig(ref, secret)
 	created, err := d.api.ContainerCreate(ctx, cfg, host, nil, nil, EgressContainerName)
 	if err != nil {
-		return "", fmt.Errorf("dockerx: create container %s: %w", EgressContainerName, err)
+		return "", "", fmt.Errorf("dockerx: create container %s: %w", EgressContainerName, err)
 	}
 	if err := d.api.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("dockerx: start container %s: %w", EgressContainerName, err)
+		return "", "", fmt.Errorf("dockerx: start container %s: %w", EgressContainerName, err)
 	}
-	return d.egressControlURL(ctx, created.ID)
+	url, err := d.egressControlURL(ctx, created.ID)
+	return url, created.ID, err
 }
 
 // removeEgressContainer force-removes the egress container, keeping its

@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nvasion/routini-runner/internal/dockerx"
@@ -238,8 +239,11 @@ type Options struct {
 
 // Manager tracks the running agent tasks.
 type Manager struct {
-	opts    Options
-	enabled bool
+	opts Options
+	// enabled and daemon start from Options and change once, when Enable
+	// switches a Manager on after Docker answered late (see Enable).
+	enabled atomic.Bool
+	daemon  atomic.Pointer[daemonRef]
 	// secret is shared with the egress container and authenticates every
 	// control API call. It is generated once per Manager and never logged.
 	secret string
@@ -270,14 +274,17 @@ func New(opts Options) (*Manager, error) {
 		}
 		secret = s
 	}
-	return &Manager{
-		opts: opts,
-		// A Manager without a daemon refuses every task rather than
-		// panicking on the first call.
-		enabled: opts.Enabled && opts.Docker != nil,
-		secret:  secret,
-		jobs:    make(map[string]*job),
-	}, nil
+	m := &Manager{
+		opts:   opts,
+		secret: secret,
+		jobs:   make(map[string]*job),
+	}
+	// A Manager without a daemon refuses every task rather than panicking on
+	// the first call.
+	if opts.Enabled {
+		m.Enable(opts.Docker)
+	}
+	return m, nil
 }
 
 // newSecret returns the hex-encoded egress secret.
@@ -371,7 +378,7 @@ func (m *Manager) Start(msg StartMsg, send SendFunc) {
 	}
 	// Step 1, in the order of PROTOCOL.md 2.6. The image allow-list is
 	// checked before anything is reserved or created.
-	if !m.enabled {
+	if !m.enabled.Load() {
 		send(ErrorExit(msg.ID, ErrDisabled))
 		return
 	}
@@ -505,7 +512,7 @@ func timeoutFor(sec *int) time.Duration {
 // lifecycle runs steps 2 to 5 and, once a session has been opened, always
 // closes it (step 7) on the way out.
 func (m *Manager) lifecycle(ctx context.Context, j *job, msg StartMsg) (code *int, stats *EgressStats, err error) {
-	d := m.opts.Docker
+	d := m.docker()
 	eg := msg.Egress
 
 	// Step 2: the shared egress proxy and this task's internal network.
@@ -633,7 +640,7 @@ func (m *Manager) Cancel(id string) {
 // block until the tasks are gone.
 func (m *Manager) CancelAll() {
 	jobs := m.snapshot()
-	if len(jobs) == 0 && !m.enabled {
+	if len(jobs) == 0 && !m.enabled.Load() {
 		return
 	}
 	m.logf("agents: canceling %d running task(s)", len(jobs))
@@ -684,7 +691,7 @@ func (m *Manager) stop(j *job, r stopReason) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), StopGrace+stopSlack)
 	defer cancel()
-	if err := m.opts.Docker.Stop(ctx, j.name, StopGrace); err != nil {
+	if err := m.docker().Stop(ctx, j.name, StopGrace); err != nil {
 		m.logf("agent %s: stop container: %v", j.id, err)
 	}
 	// Stop only reaches a container that exists, so the run context is
@@ -701,7 +708,7 @@ func (m *Manager) stop(j *job, r stopReason) {
 func (m *Manager) killLeftovers() {
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	if err := m.opts.Docker.KillByLabels(ctx, managedLabels()); err != nil {
+	if err := m.docker().KillByLabels(ctx, managedLabels()); err != nil {
 		m.logf("agents: kill leftover containers: %v", err)
 	}
 }

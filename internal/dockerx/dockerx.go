@@ -212,6 +212,7 @@ type apiClient interface {
 	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
 	ContainerKill(ctx context.Context, containerID, signal string) error
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
+	ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
 
 	ContainerExecCreate(ctx context.Context, container string, options container.ExecOptions) (types.IDResponse, error)
 	ContainerExecStart(ctx context.Context, execID string, config container.ExecStartOptions) error
@@ -227,6 +228,12 @@ type apiClient interface {
 // dockerClient implements Docker on top of the Engine API.
 type dockerClient struct {
 	api apiClient
+	// egressReady waits for a routini-egress control API to answer; nil skips
+	// the wait (unit tests that only exercise the Docker calls).
+	egressReady func(ctx context.Context, controlURL, secret string) error
+	// refreshEgress pulls the egress image whenever the container is
+	// (re)created, so a republished image reaches hosts without a manual pull.
+	refreshEgress bool
 }
 
 // New returns a Docker client. It reads the usual DOCKER_* environment
@@ -242,7 +249,7 @@ func New(dockerHost string) (Docker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dockerx: create docker client: %w", err)
 	}
-	return &dockerClient{api: api}, nil
+	return &dockerClient{api: api, egressReady: waitEgressReady, refreshEgress: true}, nil
 }
 
 // Ping reports the daemon's version.

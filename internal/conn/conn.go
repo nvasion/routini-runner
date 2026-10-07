@@ -91,6 +91,9 @@ type Options struct {
 	// is only used when Config.Capabilities.Agents is true, and is pinged
 	// like any other; tests inject a fake daemon through it.
 	Docker dockerx.Docker
+	// DockerRetry is how often a runner with agents enabled re-pings a Docker
+	// daemon that did not answer at startup (30s).
+	DockerRetry time.Duration
 
 	// UpdateHelper and UpdateExec replace the update helper's path and the
 	// way it is run (sudo); tests inject both.
@@ -109,14 +112,22 @@ type Runner struct {
 	ptys   *ptyx.Manager
 	agents *agentx.Manager
 	envs   *envx.Manager
-	docker dockerInfo
+
+	// dockerMu guards docker and capsChanged: the Docker retry loop updates
+	// them while connections read them.
+	dockerMu sync.Mutex
+	docker   dockerInfo
+	// capsChanged is closed (and replaced) when what this runner serves
+	// changes, so each connection can tell the server (PROTOCOL.md 2.1).
+	capsChanged chan struct{}
 
 	updater *updatex.Updater
 	updates bool // the update helper answered at startup
 }
 
-// dockerInfo is the outcome of the startup Docker probe. Agents are served
-// only when it succeeded (PROTOCOL.md section 2.1).
+// dockerInfo is the outcome of the Docker probe: at startup and, while it
+// fails, every DockerRetry. Agents are served only once it succeeded
+// (PROTOCOL.md section 2.1).
 type dockerInfo struct {
 	available bool
 	version   string
@@ -145,6 +156,9 @@ func New(opts Options) (*Runner, error) {
 	}
 	if opts.WriteTimeout <= 0 {
 		opts.WriteTimeout = 10 * time.Second
+	}
+	if opts.DockerRetry <= 0 {
+		opts.DockerRetry = 30 * time.Second
 	}
 	if opts.FactsInterval <= 0 {
 		opts.FactsInterval = 60 * time.Second
@@ -243,11 +257,12 @@ func New(opts Options) (*Runner, error) {
 		ptys: ptyx.NewManager(ptyx.Options{
 			Enabled: cfg.Capabilities.Pty, HangupGrace: opts.HangupGrace, Logger: opts.Logger,
 		}),
-		agents:  agents,
-		envs:    envs,
-		docker:  docker,
-		updater: updater,
-		updates: updates,
+		agents:      agents,
+		envs:        envs,
+		docker:      docker,
+		capsChanged: make(chan struct{}),
+		updater:     updater,
+		updates:     updates,
 	}, nil
 }
 
@@ -310,6 +325,9 @@ func dialDocker(cfg *config.Config, injected dockerx.Docker) (dockerx.Docker, st
 // down gracefully and returns nil) or a fatal condition occurs (it returns a
 // *FatalError).
 func (r *Runner) Run(ctx context.Context) error {
+	if r.cfg.Capabilities.Agents && !r.dockerState().available {
+		go r.retryDocker(ctx)
+	}
 	attempt := 0
 	for {
 		res := r.session(ctx)
@@ -438,7 +456,7 @@ func (r *Runner) capabilities() []string {
 	if r.cfg.Capabilities.Pty {
 		caps = append(caps, "pty")
 	}
-	if r.cfg.Capabilities.Agents && r.docker.available {
+	if r.cfg.Capabilities.Agents && r.dockerState().available {
 		caps = append(caps, "agents", "environments")
 	}
 	if r.updates {
@@ -447,14 +465,57 @@ func (r *Runner) capabilities() []string {
 	return caps
 }
 
+func (r *Runner) dockerState() dockerInfo {
+	r.dockerMu.Lock()
+	defer r.dockerMu.Unlock()
+	return r.docker
+}
+
+// capsChangedCh returns the channel closed at the next capability change.
+func (r *Runner) capsChangedCh() <-chan struct{} {
+	r.dockerMu.Lock()
+	defer r.dockerMu.Unlock()
+	return r.capsChanged
+}
+
+// retryDocker re-pings Docker while agents are configured but the daemon did
+// not answer, so a daemon that starts after the runner (at boot, or started
+// by hand later) turns agents on without a restart. It returns once Docker
+// answers or ctx ends.
+func (r *Runner) retryDocker(ctx context.Context) {
+	t := time.NewTicker(r.opts.DockerRetry)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		client, ver, err := dialDocker(r.cfg, r.opts.Docker)
+		if err != nil {
+			continue
+		}
+		r.agents.Enable(client)
+		r.envs.Enable(client)
+		r.dockerMu.Lock()
+		r.docker = dockerInfo{available: true, version: ver}
+		close(r.capsChanged)
+		r.capsChanged = make(chan struct{})
+		r.dockerMu.Unlock()
+		r.log.Printf("Docker answered: agents enabled (docker %s, up to %d running at a time)", ver, r.cfg.MaxConcurrentAgents)
+		return
+	}
+}
+
 // hostFacts collects the host facts and adds the docker object, which only
 // the connection can fill in (PROTOCOL.md section 2.2).
 func (r *Runner) hostFacts() facts.Facts {
 	f := r.opts.Facts()
-	if r.docker.available {
+	docker := r.dockerState()
+	if docker.available {
 		f.Docker = &facts.Docker{
 			Available:           true,
-			Version:             r.docker.version,
+			Version:             docker.version,
 			AgentsRunning:       r.agents.Running(),
 			MaxAgents:           r.cfg.MaxConcurrentAgents,
 			EnvironmentsRunning: r.envs.Running(),
@@ -462,8 +523,8 @@ func (r *Runner) hostFacts() facts.Facts {
 		}
 	}
 	f.Agents = &facts.Agents{Configured: r.cfg.Capabilities.Agents}
-	if r.cfg.Capabilities.Agents && !r.docker.available {
-		f.Agents.Error = r.docker.err
+	if r.cfg.Capabilities.Agents && !docker.available {
+		f.Agents.Error = docker.err
 	}
 	return f
 }
@@ -801,12 +862,24 @@ func (r *Runner) dispatch(st *dispatchState, data []byte) error {
 func (r *Runner) factsLoop(send func(any), done <-chan struct{}) {
 	t := time.NewTicker(r.opts.FactsInterval)
 	defer t.Stop()
+	changed := r.capsChangedCh()
 	for {
 		select {
 		case <-done:
 			return
 		case <-t.C:
 			send(factsMsg{Type: "facts", Facts: r.hostFacts()})
+		case <-changed:
+			// What this runner serves changed after hello (Docker came up):
+			// tell the server, then send facts with the docker object.
+			changed = r.capsChangedCh()
+			send(capabilitiesMsg{Type: "capabilities", Capabilities: r.capabilities()})
+			send(factsMsg{Type: "facts", Facts: r.hostFacts()})
 		}
 	}
+}
+
+type capabilitiesMsg struct {
+	Type         string   `json:"type"`
+	Capabilities []string `json:"capabilities"`
 }

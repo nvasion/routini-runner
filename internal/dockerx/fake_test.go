@@ -36,6 +36,7 @@ type fakeAPI struct {
 	containerStop    func(ctx context.Context, id string, opts container.StopOptions) error
 	containerKill    func(ctx context.Context, id, signal string) error
 	containerRemove  func(ctx context.Context, id string, opts container.RemoveOptions) error
+	containerLogs    func(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error)
 
 	containerExecCreate  func(ctx context.Context, id string, opts container.ExecOptions) (types.IDResponse, error)
 	containerExecStart   func(ctx context.Context, execID string, cfg container.ExecStartOptions) error
@@ -271,3 +272,11 @@ func (f *fakeAPI) VolumeRemove(ctx context.Context, id string, force bool) error
 func noopStart(context.Context, string, container.StartOptions) error { return nil }
 
 func noopRemove(context.Context, string, container.RemoveOptions) error { return nil }
+
+func (f *fakeAPI) ContainerLogs(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error) {
+	f.record("ContainerLogs(%s,%s)", id, opts.Tail)
+	if f.containerLogs == nil {
+		return nil, unexpected("ContainerLogs")
+	}
+	return f.containerLogs(ctx, id, opts)
+}

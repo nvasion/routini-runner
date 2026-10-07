@@ -35,7 +35,7 @@ func (m *Manager) volumeEnsure(msg OpMsg, send SendFunc) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	if err := m.opts.Docker.EnsureVolume(ctx, a.Name, a.Labels); err != nil {
+	if err := m.docker().EnsureVolume(ctx, a.Name, a.Labels); err != nil {
 		send(doneErr(msg.ID, err.Error()))
 		return
 	}
@@ -52,7 +52,7 @@ func (m *Manager) volumeRemove(msg OpMsg, send SendFunc) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	if err := m.opts.Docker.RemoveVolume(ctx, a.Name); err != nil {
+	if err := m.docker().RemoveVolume(ctx, a.Name); err != nil {
 		send(doneErr(msg.ID, err.Error()))
 		return
 	}
@@ -73,7 +73,7 @@ func (m *Manager) networkEnsure(msg OpMsg, send SendFunc) {
 		return
 	}
 
-	d := m.opts.Docker
+	d := m.docker()
 	ctx, cancel := context.WithTimeout(context.Background(), pullOpTimeout)
 	defer cancel()
 	if err := d.EnsureImage(ctx, a.EgressImage, dockerx.PullMissing); err != nil {
@@ -212,7 +212,7 @@ func (m *Manager) containerStart(msg OpMsg, send SendFunc) {
 		return
 	}
 
-	d := m.opts.Docker
+	d := m.docker()
 	ctx, cancel := context.WithTimeout(context.Background(), pullOpTimeout)
 	defer cancel()
 
@@ -276,7 +276,7 @@ func (m *Manager) containerRemove(msg OpMsg, send SendFunc) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	if err := m.opts.Docker.RemoveEnvContainer(ctx, a.ContainerID); err != nil {
+	if err := m.docker().RemoveEnvContainer(ctx, a.ContainerID); err != nil {
 		send(doneErr(msg.ID, err.Error()))
 		return
 	}
@@ -298,7 +298,7 @@ func (m *Manager) containerState(msg OpMsg, send SendFunc) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), quickOpTimeout)
 	defer cancel()
-	info, err := m.opts.Docker.InspectEnv(ctx, a.ContainerID)
+	info, err := m.docker().InspectEnv(ctx, a.ContainerID)
 	if err != nil {
 		send(doneErr(msg.ID, err.Error()))
 		return
@@ -327,7 +327,7 @@ func (m *Manager) pull(msg OpMsg, send SendFunc) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pullOpTimeout)
 	defer cancel()
-	if err := m.opts.Docker.EnsureImage(ctx, a.Image, dockerx.PullAlways); err != nil {
+	if err := m.docker().EnsureImage(ctx, a.Image, dockerx.PullAlways); err != nil {
 		send(doneErr(msg.ID, err.Error()))
 		return
 	}

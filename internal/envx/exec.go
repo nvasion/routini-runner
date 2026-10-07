@@ -111,7 +111,7 @@ func (m *Manager) runExec(msg OpMsg, send SendFunc) {
 	}
 
 	checkCtx, cancelCheck := context.WithTimeout(context.Background(), quickOpTimeout)
-	info, err := m.opts.Docker.InspectEnv(checkCtx, a.ContainerID)
+	info, err := m.docker().InspectEnv(checkCtx, a.ContainerID)
 	cancelCheck()
 	if err != nil {
 		send(doneErr(msg.ID, err.Error()))
@@ -135,7 +135,7 @@ func (m *Manager) runExec(msg OpMsg, send SendFunc) {
 	defer timer.Stop()
 
 	spec := dockerx.ExecSpec{Cmd: a.Cmd, Env: a.Env, Workdir: a.Workdir}
-	code, runErr := m.opts.Docker.ExecStreaming(ctx, a.ContainerID, spec, func(stream, line string) {
+	code, runErr := m.docker().ExecStreaming(ctx, a.ContainerID, spec, func(stream, line string) {
 		job.sendMsg(OutputMsg{Type: TypeOutput, ID: msg.ID, Stream: stream, Data: line})
 	})
 	cancel()
