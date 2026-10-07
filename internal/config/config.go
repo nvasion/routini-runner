@@ -26,6 +26,9 @@ const DefaultMaxConcurrentExec = 8
 // DefaultMaxConcurrentAgents is used when maxConcurrentAgents is missing or not positive.
 const DefaultMaxConcurrentAgents = 2
 
+// DefaultMaxEnvironments is used when maxEnvironments is missing or not positive.
+const DefaultMaxEnvironments = 4
+
 // DefaultAgentImagePrefix is the only agent image prefix trusted when
 // agentImagePrefixes is missing or empty.
 const DefaultAgentImagePrefix = "ghcr.io/nvasion/"
@@ -68,6 +71,10 @@ type Config struct {
 	// non-positive value means DefaultMaxConcurrentAgents.
 	MaxConcurrentAgents int `json:"maxConcurrentAgents"`
 
+	// MaxEnvironments caps concurrently running environment containers. Any
+	// non-positive value means DefaultMaxEnvironments.
+	MaxEnvironments int `json:"maxEnvironments"`
+
 	// DockerHost addresses the Docker daemon. "" means
 	// unix:///var/run/docker.sock; the DOCKER_HOST environment variable
 	// overrides this field.
@@ -95,6 +102,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxConcurrentAgents <= 0 {
 		c.MaxConcurrentAgents = DefaultMaxConcurrentAgents
+	}
+	if c.MaxEnvironments <= 0 {
+		c.MaxEnvironments = DefaultMaxEnvironments
 	}
 	prefixes := make([]string, 0, len(c.AgentImagePrefixes))
 	for _, p := range c.AgentImagePrefixes {
@@ -150,7 +160,8 @@ func (c *Config) Validate() error {
 
 // Load reads and validates the config at path. Missing fields take the
 // protocol defaults (exec and pty on, agents off, maxConcurrentExec 8,
-// maxConcurrentAgents 2, agentImagePrefixes ["ghcr.io/nvasion/"]).
+// maxConcurrentAgents 2, maxEnvironments 4, agentImagePrefixes
+// ["ghcr.io/nvasion/"]).
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

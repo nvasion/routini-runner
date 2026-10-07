@@ -150,7 +150,7 @@ func TestHelloAdvertisesAgentsOnlyWhenDockerAnswers(t *testing.T) {
 		{
 			name:       "agents on and docker answers",
 			mutate:     withAgents(&fakeDocker{pingVersion: dockerVer}),
-			wantCaps:   []any{"exec", "pty", "agents"},
+			wantCaps:   []any{"exec", "pty", "agents", "environments"},
 			wantDocker: true,
 		},
 		{
@@ -189,6 +189,7 @@ func TestHelloAdvertisesAgentsOnlyWhenDockerAnswers(t *testing.T) {
 				want := map[string]any{
 					"available": true, "version": dockerVer,
 					"agentsRunning": float64(0), "maxAgents": float64(config.DefaultMaxConcurrentAgents),
+					"environmentsRunning": float64(0), "maxEnvironments": float64(config.DefaultMaxEnvironments),
 				}
 				if !reflect.DeepEqual(docker, want) {
 					t.Errorf("facts.docker = %v, want %v", docker, want)

@@ -182,8 +182,9 @@ sudo systemctl restart routini-runner
 The capability is read at startup, so the restart is required. The runner
 probes the daemon once while starting and logs either `agents enabled: docker
 <version>` or a single warning that Docker is unavailable; only in the first
-case does it offer `agents` to Routini and report the daemon in the `docker`
-object of its facts (`available`, `version`, `agentsRunning`, `maxAgents`).
+case does it offer `agents` and `environments` to Routini and report the
+daemon in the `docker` object of its facts (`available`, `version`,
+`agentsRunning`, `maxAgents`, `environmentsRunning`, `maxEnvironments`).
 
 On a host that already runs v0.3.0 or newer, root can also switch agents on
 without re-running the installer:
@@ -227,6 +228,21 @@ All of these live in `config.json` next to `capabilities`:
 | `containerRuntime` | `""` (Docker's own runtime) | Set to `"runsc"` to run agents under [gVisor](https://gvisor.dev/) for kernel-level isolation. The runtime must already be registered with Docker. |
 | `dockerHost` | `""` (`unix:///var/run/docker.sock`) | Docker endpoint to use. `$DOCKER_HOST` overrides it. |
 
+### Environments on this server
+
+**Environments** (long-lived, interactive containers a user works in — shell,
+file edits, exec) come bundled with the agents opt-in above: there is no
+separate capability flag. Once `capabilities.agents` is `true` and Docker
+answered its startup ping, the runner advertises both `agents` and
+`environments`, and the same egress, sandboxing and `agentImagePrefixes`
+rules apply to environment containers as to agents.
+
+Each environment's data volume **lives on this host** — it is not copied
+anywhere else — so removing the runner or its Docker data removes that data
+too. `maxEnvironments` (default `4`, next to `maxConcurrentAgents` in
+`config.json`) caps how many environment containers run at the same time;
+any value that is not positive means 4.
+
 ## Configuration
 
 `/etc/routini-runner/config.json` (or `--config PATH`, or
@@ -242,6 +258,7 @@ All of these live in `config.json` next to `capabilities`:
   "maxConcurrentExec": 8,
   "agentImagePrefixes": ["ghcr.io/nvasion/"],
   "maxConcurrentAgents": 2,
+  "maxEnvironments": 4,
   "dockerHost": "",
   "containerRuntime": ""
 }

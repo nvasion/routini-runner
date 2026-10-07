@@ -385,8 +385,10 @@ type welcomeMsg struct {
 }
 
 // capabilities lists the features this runner will actually serve. "agents"
-// needs both the config flag and a Docker daemon that answered the startup
-// ping (PROTOCOL.md section 2.1).
+// and "environments" both need the config flag and a Docker daemon that
+// answered the startup ping (PROTOCOL.md section 2.1): environments come
+// bundled with the agents opt-in, they do not have a config flag of their
+// own.
 func (r *Runner) capabilities() []string {
 	caps := []string{}
 	if r.cfg.Capabilities.Exec {
@@ -396,7 +398,7 @@ func (r *Runner) capabilities() []string {
 		caps = append(caps, "pty")
 	}
 	if r.cfg.Capabilities.Agents && r.docker.available {
-		caps = append(caps, "agents")
+		caps = append(caps, "agents", "environments")
 	}
 	if r.updates {
 		caps = append(caps, "update")
@@ -410,10 +412,12 @@ func (r *Runner) hostFacts() facts.Facts {
 	f := r.opts.Facts()
 	if r.docker.available {
 		f.Docker = &facts.Docker{
-			Available:     true,
-			Version:       r.docker.version,
-			AgentsRunning: r.agents.Running(),
-			MaxAgents:     r.cfg.MaxConcurrentAgents,
+			Available:           true,
+			Version:             r.docker.version,
+			AgentsRunning:       r.agents.Running(),
+			MaxAgents:           r.cfg.MaxConcurrentAgents,
+			EnvironmentsRunning: 0, // a later task wires the real count
+			MaxEnvironments:     r.cfg.MaxEnvironments,
 		}
 	}
 	f.Agents = &facts.Agents{Configured: r.cfg.Capabilities.Agents}
